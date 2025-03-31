@@ -6,35 +6,26 @@ from sklearn.model_selection import train_test_split
 
 # data preprocessing
 def build_sequence(data_path, length=51):
-    data = pd.read_csv(data_path)
-    # sort by userId and timestamp
-    data = data.sort_values(by=["userId", "timestamp"])
-    # only keep userId, movieId and rating
-    columns = ["userId", "movieId", "rating"]
-    data = data[columns]
-    # only keep rating greater than 3
-    data = data[data["rating"] > 3]
-    # only keep user who have more than 5 records
-    data = data.groupby("userId").filter(lambda x: len(x) >= 5)
-    # map movieId to a new continuous id starting from 1
-    movieId_list = data["movieId"].unique()
-    movieId_map = dict(zip(movieId_list, range(1, len(movieId_list) + 1)))
-    print(f"num items: {len(movieId_list) + 1}")
-    data["movieId"] = data["movieId"].map(movieId_map)
-    # build sequence,if length is longer than the user's record, fill the sequence with 0
-    user_sequence = []
-    for userId, group in data.groupby("userId"):
-        user_sequence.append(group["movieId"].values[:length])
-    # padding sequence as [0, 0, ... x, y]
-    user_sequence = tf.keras.preprocessing.sequence.pad_sequences(user_sequence, maxlen=length, padding="pre", value=0)
 
-    # build label
-    label = user_sequence[:, -1]
-    # build input
-    input = user_sequence[:, :-1]
-    # build tf dataset
+    data = pd.read_csv(data_path).sort_values(by=["userId", "timestamp"])
+    data = data.loc[(data["rating"] > 3), ["userId", "movieId"]]
+    grouped_data = data.groupby("userId").filter(lambda x: len(x) >= 5)
+    unique_movie_ids = grouped_data["movieId"].unique()
+    movie_id_map = {movie_id: idx + 1 for idx, movie_id in enumerate(unique_movie_ids)}
+    grouped_data["movieId"] = grouped_data["movieId"].map(movie_id_map)
 
-    return input, label
+    user_sequences = []
+    for _, group in grouped_data.groupby("userId"):
+        seq = group["movieId"].values[:length]
+        if len(seq) < length:
+            seq = np.pad(seq, (length - len(seq), 0), mode="constant")
+        user_sequences.append(seq)
+
+    user_sequences = np.array(user_sequences)
+    inputs = user_sequences[:, :-1]
+    labels = user_sequences[:, -1]
+
+    return inputs, labels
 
 
 # build SASRec model
@@ -61,15 +52,14 @@ class SASRecMoE(tf.keras.Model):
         self.layer_norm = tf.keras.layers.LayerNormalization(epsilon=1e-6)
         self.output_layer = tf.keras.layers.Dense(num_items, activation="softmax")
 
-    @tf.function
+    @tf.function(reduce_retracing=True)
     def call(self, inputs, training=False, use_embedding=False):
-        # 如果 use_embedding=True，则输入是物品 ID，需要嵌入
+
         if use_embedding:
             x = self.item_embedding(inputs)  # [batch_size, seq_len] -> [batch_size, seq_len, embed_dim]
         else:
             x = inputs  # 输入已经是 [batch_size, seq_len, embed_dim]
 
-        # 添加位置编码
         seq_len = tf.shape(x)[1]
         position_embeddings = self.add_position_encoding(seq_len)
         x += position_embeddings
@@ -78,8 +68,8 @@ class SASRecMoE(tf.keras.Model):
         gating_weights = tf.reduce_mean(gating_weights, axis=1)
 
         expert_outputs = [expert_layer(x) for expert_layer in self.expert_layers]
-        expert_outputs = tf.stack(expert_outputs, axis=0)
-        weighted_expert_outputs = tf.reduce_sum(gating_weights[..., tf.newaxis] * expert_outputs, axis=0)
+        expert_outputs = tf.stack(expert_outputs, axis=1)
+        weighted_expert_outputs = tf.reduce_sum(gating_weights[..., tf.newaxis, tf.newaxis] * expert_outputs, axis=1)
 
         # Transformer layers
         for layer in self.transformer_blocks:
@@ -88,8 +78,8 @@ class SASRecMoE(tf.keras.Model):
 
         # 输出
         last_output = weighted_expert_outputs[:, -1, :]  # [batch_size, embed_dim]
-        output = self.output_layer(last_output)  # [batch_size, num_items]
-        return output
+        # output = self.output_layer(last_output)  # [batch_size, num_items]
+        return last_output
 
     def add_position_encoding(self, seq_len):
         position = tf.range(0, seq_len, dtype=tf.float32)  # shape (seq_len,)
@@ -161,7 +151,7 @@ if __name__ == "__main__":
             predictions = model(X_batch, use_embedding=True, training=False)
             loss = loss_fn(y_batch, predictions)
             val_loss += loss
-            val_acc.update_states(y_batch, predictions)
+            val_acc.update_state(y_batch, predictions)
 
         train_loss /= len(train_dataset)
         val_loss /= len(val_dataset)
