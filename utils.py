@@ -1,132 +1,109 @@
-import sys
-import copy
-import random
-import numpy as np
+# Copyright (c) Recommenders contributors.
+# Licensed under the MIT License.
+
 from collections import defaultdict
 
 
-def data_partition(fname):
-    usernum = 0
-    itemnum = 0
-    User = defaultdict(list)
-    user_train = {}
-    user_valid = {}
-    user_test = {}
-    # assume user/item index starting from 1
-    f = open('data/%s.txt' % fname, 'r')
-    for line in f:
-        u, i = line.rstrip().split(' ')
-        u = int(u)
-        i = int(i)
-        usernum = max(u, usernum)
-        itemnum = max(i, itemnum)
-        User[u].append(i)
+class SASRecDataSet:
+    """
+    A class for creating SASRec specific dataset used during
+    train, validation and testing.
 
-    for user in User:
-        nfeedback = len(User[user])
-        if nfeedback < 3:
-            user_train[user] = User[user]
-            user_valid[user] = []
-            user_test[user] = []
+    Attributes:
+        usernum: integer, total number of users
+        itemnum: integer, total number of items
+        User: dict, all the users (keys) with items as values
+        Items: set of all the items
+        user_train: dict, subset of User that are used for training
+        user_valid: dict, subset of User that are used for validation
+        user_test: dict, subset of User that are used for testing
+        col_sep: column separator in the data file
+        filename: data filename
+    """
+
+    def __init__(self, **kwargs):
+        self.usernum = 0
+        self.itemnum = 0
+        self.User = defaultdict(list)
+        self.Items = set()
+        self.user_train = {}
+        self.user_valid = {}
+        self.user_test = {}
+        self.col_sep = kwargs.get("col_sep", " ")
+        self.filename = kwargs.get("filename", None)
+
+        if self.filename:
+            with open(self.filename, "r") as fr:
+                sample = fr.readline()
+            ncols = len(sample.strip().split(self.col_sep))
+            if ncols == 3:
+                self.with_time = True
+            elif ncols == 2:
+                self.with_time = False
+            else:
+                raise ValueError(f"3 or 2 columns must be in dataset. Given {ncols} columns")
+
+    def split(self, **kwargs):
+        self.filename = kwargs.get("filename", self.filename)
+        if not self.filename:
+            raise ValueError("Filename is required")
+
+        if self.with_time:
+            self.data_partition_with_time()
         else:
-            user_train[user] = User[user][:-2]
-            user_valid[user] = []
-            user_valid[user].append(User[user][-2])
-            user_test[user] = []
-            user_test[user].append(User[user][-1])
-    return [user_train, user_valid, user_test, usernum, itemnum]
+            self.data_partition()
 
+    def data_partition(self):
+        # assume user/item index starting from 1
+        f = open(self.filename, "r")
+        for line in f:
+            u, i = line.rstrip().split(self.col_sep)
+            u = int(u)
+            i = int(i)
+            self.usernum = max(u, self.usernum)
+            self.itemnum = max(i, self.itemnum)
+            self.User[u].append(i)
 
-def evaluate(model, dataset, args, sess):
-    [train, valid, test, usernum, itemnum] = copy.deepcopy(dataset)
+        for user in self.User:
+            nfeedback = len(self.User[user])
+            if nfeedback < 3:
+                self.user_train[user] = self.User[user]
+                self.user_valid[user] = []
+                self.user_test[user] = []
+            else:
+                self.user_train[user] = self.User[user][:-2]
+                self.user_valid[user] = []
+                self.user_valid[user].append(self.User[user][-2])
+                self.user_test[user] = []
+                self.user_test[user].append(self.User[user][-1])
 
-    NDCG = 0.0
-    HT = 0.0
-    valid_user = 0.0
+    def data_partition_with_time(self):
+        # assume user/item index starting from 1
+        f = open(self.filename, "r")
+        for line in f:
+            u, i, t = line.rstrip().split(self.col_sep)
+            u = int(u)
+            i = int(i)
+            t = float(t)
+            self.usernum = max(u, self.usernum)
+            self.itemnum = max(i, self.itemnum)
+            self.User[u].append((i, t))
+            self.Items.add(i)
 
-    if usernum > 10000:
-        users = random.sample(range(1, usernum + 1), 10000)
-    else:
-        users = range(1, usernum + 1)
-    for u in users:
-
-        if len(train[u]) < 1 or len(test[u]) < 1: continue
-
-        seq = np.zeros([args.maxlen], dtype=np.int32)
-        idx = args.maxlen - 1
-        seq[idx] = valid[u][0]
-        idx -= 1
-        for i in reversed(train[u]):
-            seq[idx] = i
-            idx -= 1
-            if idx == -1: break
-        rated = set(train[u])
-        rated.add(0)
-        item_idx = [test[u][0]]
-        for _ in range(100):
-            t = np.random.randint(1, itemnum + 1)
-            while t in rated: t = np.random.randint(1, itemnum + 1)
-            item_idx.append(t)
-
-        predictions = -model.predict(sess, [u], [seq], item_idx)
-        predictions = predictions[0]
-
-        rank = predictions.argsort().argsort()[0]
-
-        valid_user += 1
-
-        if rank < 10:
-            NDCG += 1 / np.log2(rank + 2)
-            HT += 1
-        if valid_user % 100 == 0:
-            print
-            '.',
-            sys.stdout.flush()
-
-    return NDCG / valid_user, HT / valid_user
-
-
-def evaluate_valid(model, dataset, args, sess):
-    [train, valid, test, usernum, itemnum] = copy.deepcopy(dataset)
-
-    NDCG = 0.0
-    valid_user = 0.0
-    HT = 0.0
-    if usernum > 10000:
-        users = random.sample(range(1, usernum + 1), 10000)
-    else:
-        users = range(1, usernum + 1)
-    for u in users:
-        if len(train[u]) < 1 or len(valid[u]) < 1: continue
-
-        seq = np.zeros([args.maxlen], dtype=np.int32)
-        idx = args.maxlen - 1
-        for i in reversed(train[u]):
-            seq[idx] = i
-            idx -= 1
-            if idx == -1: break
-
-        rated = set(train[u])
-        rated.add(0)
-        item_idx = [valid[u][0]]
-        for _ in range(100):
-            t = np.random.randint(1, itemnum + 1)
-            while t in rated: t = np.random.randint(1, itemnum + 1)
-            item_idx.append(t)
-
-        predictions = -model.predict(sess, [u], [seq], item_idx)
-        predictions = predictions[0]
-
-        rank = predictions.argsort().argsort()[0]
-
-        valid_user += 1
-
-        if rank < 10:
-            NDCG += 1 / np.log2(rank + 2)
-            HT += 1
-        if valid_user % 100 == 0:
-            print
-            '.',
-            sys.stdout.flush()
-
-    return NDCG / valid_user, HT / valid_user
+        for user in self.User.keys():
+            # sort by time
+            items = sorted(self.User[user], key=lambda x: x[1])
+            # keep only the items
+            items = [x[0] for x in items]
+            self.User[user] = items
+            nfeedback = len(self.User[user])
+            if nfeedback < 3:
+                self.user_train[user] = self.User[user]
+                self.user_valid[user] = []
+                self.user_test[user] = []
+            else:
+                self.user_train[user] = self.User[user][:-2]
+                self.user_valid[user] = []
+                self.user_valid[user].append(self.User[user][-2])
+                self.user_test[user] = []
+                self.user_test[user].append(self.User[user][-1])
