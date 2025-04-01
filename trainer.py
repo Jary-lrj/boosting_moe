@@ -1,69 +1,97 @@
-from MoE import MoE
+import os
+import time
+import argparse
 import tensorflow as tf
-from BoostingMoE import BoostingMoE
-from utils import build_sequence
-import datetime
+from neg_sampler import WarpSampler
+from SASRec import SASRec as Model
+from tqdm import tqdm
+from utils import *
+import keras
 
-# data preprocessing
 
-if __name__ == "__main__":
+def str2bool(s):
+    if s not in {'False', 'True'}:
+        raise ValueError('Not a valid boolean string')
+    return s == 'True'
 
-    # parameters
-    num_items = 22885
-    embed_dim = 64
-    num_heads = 1
-    num_layers = 2
-    batch_size = 64
 
-    # 构造数据集
-    data_path = "./versions/1/rating.csv"
-    inputs, pos_labels, neg_labels = build_sequence(data_path, num_negatives=5, item_num=num_items)
+parser = argparse.ArgumentParser()
+parser.add_argument('--dataset', required=True)
+parser.add_argument('--train_dir', required=True)
+parser.add_argument('--batch_size', default=128, type=int)
+parser.add_argument('--lr', default=0.001, type=float)
+parser.add_argument('--maxlen', default=50, type=int)
+parser.add_argument('--hidden_units', default=50, type=int)
+parser.add_argument('--num_blocks', default=2, type=int)
+parser.add_argument('--num_epochs', default=201, type=int)
+parser.add_argument('--num_heads', default=1, type=int)
+parser.add_argument('--dropout_rate', default=0.5, type=float)
+parser.add_argument('--l2_emb', default=0.0, type=float)
 
-    # 将 inputs、neg_labels 合成 x，pos_labels 作为 y
-    x = {"inputs": inputs, "neg_labels": neg_labels}
-    y = pos_labels
+args = parser.parse_args()
+if not os.path.isdir(args.dataset + '_' + args.train_dir):
+    os.makedirs(args.dataset + '_' + args.train_dir)
+with open(os.path.join(args.dataset + '_' + args.train_dir, 'args.txt'), 'w') as f:
+    f.write('\n'.join([str(k) + ',' + str(v) for k, v in sorted(vars(args).items(), key=lambda x: x[0])]))
+f.close()
 
-    # 构建 Dataset：每个样本是 (x_dict, y)
-    dataset = tf.data.Dataset.from_tensor_slices((x, y))
+dataset = data_partition(args.dataset)
+[user_train, user_valid, user_test, usernum, itemnum] = dataset
+num_batch = len(user_train) // args.batch_size  # 使用 // 进行整除
+cc = 0.0
+for u in user_train:
+    cc += len(user_train[u])
+print('average sequence length: %.2f' % (cc / len(user_train)))
 
-    # 分割训练集、验证集、测试集
-    total_size = len(inputs)
-    valid_size = int(0.1 * total_size)
-    test_size = int(0.1 * total_size)
-    train_size = total_size - test_size - valid_size
+f = open(os.path.join(args.dataset + '_' + args.train_dir, 'log.txt'), 'w')
 
-    dataset = dataset.shuffle(buffer_size=total_size, seed=42)
-    train_dataset = dataset.take(train_size).batch(batch_size)
-    val_dataset = dataset.skip(train_size).take(valid_size).batch(batch_size)
-    test_dataset = dataset.skip(train_size + valid_size).batch(batch_size)
+# 设置 GPU 选项
+physical_devices = tf.config.list_physical_devices('GPU')
+if physical_devices:
+    tf.config.set_logical_device_configuration(physical_devices[0],
+                                               [tf.config.LogicalDeviceConfiguration(memory_limit=4096)])
+    tf.config.experimental.set_memory_growth(physical_devices[0], True)
 
-    # 使用 tensorboard方便记录训练过程
-    log_dir = "./logs/fit/" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=log_dir)
+sampler = WarpSampler(user_train, usernum, itemnum, batch_size=args.batch_size, maxlen=args.maxlen, n_workers=3)
+model = Model(usernum, itemnum, args)
 
-    # early stopping
-    early_stopping = tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=3, restore_best_weights=True)
+# TensorFlow 2.x 中没有初始化变量的步骤
+# 使用 tf.keras.Model 和 tf.Variable 时不需要显式的初始化步骤
 
-    # 模型训练
-    model = BoostingMoE(num_items, embed_dim, num_heads, num_layers, num_experts=2)
+T = 0.0
+t0 = time.time()
 
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(1e-3),
-        loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
-        metrics=["accuracy"],
-    )
+try:
+    for epoch in range(1, args.num_epochs + 1):
 
-    model.fit(
-        train_dataset,
-        validation_data=val_dataset,
-        epochs=30,
-        callbacks=[tensorboard_callback, early_stopping],
-    )
+        for step in tqdm(range(num_batch), total=num_batch, ncols=70, leave=False, unit='b'):
+            u, seq, pos, neg = sampler.next_batch()
+            with tf.GradientTape() as tape:
+                auc, loss = model(u, seq, pos, neg, is_training=True)
 
-    evaluate_metrics = model.evaluate(test_dataset)
-    print(evaluate_metrics)
+            grads = tape.gradient(loss, model.trainable_variables)
+            optimizer = keras.optimizers.Adam(learning_rate=args.lr)
+            optimizer.apply_gradients(zip(grads, model.trainable_variables))
 
-    predictions = model.predict(test_dataset)
-    print(predictions)
+        if epoch % 20 == 0:
+            t1 = time.time() - t0
+            T += t1
+            print('Evaluating')
+            t_test = evaluate(model, dataset, args)
+            t_valid = evaluate_valid(model, dataset, args)
+            print('')
+            print(f'epoch:{epoch}, time: {T:.2f}(s), valid (NDCG@10: {t_valid[0]:.4f}, HR@10: {t_valid[1]:.4f}), '
+                  f'test (NDCG@10: {t_test[0]:.4f}, HR@10: {t_test[1]:.4f})')
 
-    model.summary()
+            f.write(str(t_valid) + ' ' + str(t_test) + '\n')
+            f.flush()
+            t0 = time.time()
+except Exception as e:
+    print(f"An error occurred: {e}")
+    sampler.close()
+    f.close()
+    exit(1)
+
+f.close()
+sampler.close()
+print("Done")

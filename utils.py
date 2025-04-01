@@ -1,50 +1,132 @@
-import pandas as pd
+import sys
+import copy
+import random
 import numpy as np
-import tensorflow as tf
-from neg_sampler import NegativeSampler
+from collections import defaultdict
 
 
-def build_sequence(data_path, length=51, num_negatives=5, item_num=22885):
-    data = pd.read_csv(data_path)
+def data_partition(fname):
+    usernum = 0
+    itemnum = 0
+    User = defaultdict(list)
+    user_train = {}
+    user_valid = {}
+    user_test = {}
+    # assume user/item index starting from 1
+    f = open('data/%s.txt' % fname, 'r')
+    for line in f:
+        u, i = line.rstrip().split(' ')
+        u = int(u)
+        i = int(i)
+        usernum = max(u, usernum)
+        itemnum = max(i, itemnum)
+        User[u].append(i)
 
-    # 1. 预处理和排序
-    data = data.sort_values(by=["userId", "timestamp"])
-    data = data[["userId", "movieId", "rating"]]
-
-    # 2. 过滤评分和活跃用户
-    data = data[data["rating"] > 3]
-    data = data.groupby("userId").filter(lambda x: len(x) >= 5)
-
-    # 3. 编号 movieId，0 用作 padding
-    movieId_list = data["movieId"].unique()
-    movieId_map = {mid: idx + 1 for idx, mid in enumerate(movieId_list)}  # 从 1 开始，0 保留给 padding
-    data["movieId"] = data["movieId"].map(movieId_map)
-
-    # 4. 构建序列（每个用户一条，按时间顺序）
-    user_sequence = []
-    for userId, group in data.groupby("userId"):
-        seq = group["movieId"].values[:length]
-        user_sequence.append(seq)
-
-    # 5. 用 0 在前方 padding，统一长度
-    user_sequence = tf.keras.preprocessing.sequence.pad_sequences(user_sequence, maxlen=length, padding="pre", value=0)
-
-    # 6. 构建输入和标签
-    inputs = user_sequence[:, :-1]  # shape: (num_users, length - 1)
-    labels = user_sequence[:, -1]  # shape: (num_users,)
-
-    # 构建用户历史（用于负采样时排除）
-    user_histories = [set(seq) - {0} for seq in inputs]  # 去掉 padding 0
-    sampler = NegativeSampler(item_num=item_num - 1, num_negatives=num_negatives)  # -1 是因为 0 是 padding
-    neg_samples = sampler.sample(user_histories, labels)  # shape: (batch_size, num_negatives)
-
-    # 让inputs和labels成为张量
-    inputs = tf.convert_to_tensor(inputs, dtype=tf.int32)
-    labels = tf.convert_to_tensor(labels, dtype=tf.int32)
-
-    return inputs, labels, neg_samples
+    for user in User:
+        nfeedback = len(User[user])
+        if nfeedback < 3:
+            user_train[user] = User[user]
+            user_valid[user] = []
+            user_test[user] = []
+        else:
+            user_train[user] = User[user][:-2]
+            user_valid[user] = []
+            user_valid[user].append(User[user][-2])
+            user_test[user] = []
+            user_test[user].append(User[user][-1])
+    return [user_train, user_valid, user_test, usernum, itemnum]
 
 
-if __name__ == "__main__":
-    data_path = "./versions/1/rating.csv"
-    inputs, labels = build_sequence(data_path)
+def evaluate(model, dataset, args, sess):
+    [train, valid, test, usernum, itemnum] = copy.deepcopy(dataset)
+
+    NDCG = 0.0
+    HT = 0.0
+    valid_user = 0.0
+
+    if usernum > 10000:
+        users = random.sample(range(1, usernum + 1), 10000)
+    else:
+        users = range(1, usernum + 1)
+    for u in users:
+
+        if len(train[u]) < 1 or len(test[u]) < 1: continue
+
+        seq = np.zeros([args.maxlen], dtype=np.int32)
+        idx = args.maxlen - 1
+        seq[idx] = valid[u][0]
+        idx -= 1
+        for i in reversed(train[u]):
+            seq[idx] = i
+            idx -= 1
+            if idx == -1: break
+        rated = set(train[u])
+        rated.add(0)
+        item_idx = [test[u][0]]
+        for _ in range(100):
+            t = np.random.randint(1, itemnum + 1)
+            while t in rated: t = np.random.randint(1, itemnum + 1)
+            item_idx.append(t)
+
+        predictions = -model.predict(sess, [u], [seq], item_idx)
+        predictions = predictions[0]
+
+        rank = predictions.argsort().argsort()[0]
+
+        valid_user += 1
+
+        if rank < 10:
+            NDCG += 1 / np.log2(rank + 2)
+            HT += 1
+        if valid_user % 100 == 0:
+            print
+            '.',
+            sys.stdout.flush()
+
+    return NDCG / valid_user, HT / valid_user
+
+
+def evaluate_valid(model, dataset, args, sess):
+    [train, valid, test, usernum, itemnum] = copy.deepcopy(dataset)
+
+    NDCG = 0.0
+    valid_user = 0.0
+    HT = 0.0
+    if usernum > 10000:
+        users = random.sample(range(1, usernum + 1), 10000)
+    else:
+        users = range(1, usernum + 1)
+    for u in users:
+        if len(train[u]) < 1 or len(valid[u]) < 1: continue
+
+        seq = np.zeros([args.maxlen], dtype=np.int32)
+        idx = args.maxlen - 1
+        for i in reversed(train[u]):
+            seq[idx] = i
+            idx -= 1
+            if idx == -1: break
+
+        rated = set(train[u])
+        rated.add(0)
+        item_idx = [valid[u][0]]
+        for _ in range(100):
+            t = np.random.randint(1, itemnum + 1)
+            while t in rated: t = np.random.randint(1, itemnum + 1)
+            item_idx.append(t)
+
+        predictions = -model.predict(sess, [u], [seq], item_idx)
+        predictions = predictions[0]
+
+        rank = predictions.argsort().argsort()[0]
+
+        valid_user += 1
+
+        if rank < 10:
+            NDCG += 1 / np.log2(rank + 2)
+            HT += 1
+        if valid_user % 100 == 0:
+            print
+            '.',
+            sys.stdout.flush()
+
+    return NDCG / valid_user, HT / valid_user
