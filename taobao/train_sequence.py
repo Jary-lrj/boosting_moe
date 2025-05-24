@@ -325,7 +325,9 @@ class SASRec(torch.nn.Module):
 def train_model(model, train_loader, valid_loader, test_loader, args):
     print("Training model...")
     criterion = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizers = [
+        torch.optim.Adam(model.parameters(), lr=args.lr) for _ in range(args.num_experts)
+    ]  # 每个专家一个优化器
 
     for epoch in range(1, args.epochs + 1):
         # 设置当前训练的专家索引
@@ -355,9 +357,9 @@ def train_model(model, train_loader, valid_loader, test_loader, args):
                 logits = model(user_id, log_seq, item_id, pid, hour, dow, hour_block, is_weekend)
                 loss = criterion(logits.view(-1), label.view(-1))
 
-                optimizer.zero_grad()
+                optimizers[expert_idx].zero_grad()
                 loss.backward()
-                optimizer.step()
+                optimizers[expert_idx].step()
 
                 total_loss += loss.item()
                 print(
