@@ -385,7 +385,7 @@ def train_model(model, train_loader, valid_loader, test_loader, args):
             )
         # 最终测试结果 + 绘图
         print("Final test...")
-        test_loss, test_auc, test_ctr, test_true_ctr = evaluate(model, test_loader, criterion, args, plot_roc=True)
+        test_loss, test_auc, test_ctr, test_true_ctr = evaluate(model, test_loader, criterion, args)
         wandb.log({"test_loss": test_loss, "test_auc": test_auc, "test_ctr": test_ctr, "test_true_ctr": test_true_ctr})
         print("Final test done.")
 
