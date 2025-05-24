@@ -1,69 +1,65 @@
-from MoE import MoE
+import os
+import time
 import tensorflow as tf
-from BoostingMoE import BoostingMoE
-from utils import build_sequence
-import datetime
+from neg_sampler import WarpSampler
+from SASRec import SASREC
+from tqdm import tqdm
+from utils import *
+import keras
+from recommenders.utils.timer import Timer
 
-# data preprocessing
+print(f"Tensorflow version: {tf.__version__}")
+tf.get_logger().setLevel('ERROR')
 
-if __name__ == "__main__":
+num_epochs = 5
+batch_size = 128
+seed = 42
 
-    # parameters
-    num_items = 22885
-    embed_dim = 64
-    num_heads = 1
-    num_layers = 2
-    batch_size = 64
+data_dir = './data'
+dataset = 'ml-1m'
 
-    # 构造数据集
-    data_path = "./versions/1/rating.csv"
-    inputs, pos_labels, neg_labels = build_sequence(data_path, num_negatives=5, item_num=num_items)
+lr = 1e-3
+maxlen = 50
+num_blocks = 2
+hidden_units = 100
+num_heads = 1
+dropout_rate = 0.1
+l2_emb = 0.0
+num_neg_test = 100
+model_name = 'sasrec'
 
-    # 将 inputs、neg_labels 合成 x，pos_labels 作为 y
-    x = {"inputs": inputs, "neg_labels": neg_labels}
-    y = pos_labels
+input_file = os.path.join(data_dir, f'{dataset}.txt')
 
-    # 构建 Dataset：每个样本是 (x_dict, y)
-    dataset = tf.data.Dataset.from_tensor_slices((x, y))
+data = SASRecDataSet(inputfile=input_file)
+data.split()
 
-    # 分割训练集、验证集、测试集
-    total_size = len(inputs)
-    valid_size = int(0.1 * total_size)
-    test_size = int(0.1 * total_size)
-    train_size = total_size - test_size - valid_size
+num_steps = int(len(data.user_train / batch_size))
+cc = 0.0
+for u in data.user_train:
+    cc += len(data.user_train[u])
+print('%g Users and %g items' % (data.usernum, data.itemnum))
+print('average sequence length: %.2f' % (cc / len(data.user_train)))
 
-    dataset = dataset.shuffle(buffer_size=total_size, seed=42)
-    train_dataset = dataset.take(train_size).batch(batch_size)
-    val_dataset = dataset.skip(train_size).take(valid_size).batch(batch_size)
-    test_dataset = dataset.skip(train_size + valid_size).batch(batch_size)
+model = SASREC(item_num=data.itemnum,
+               seq_max_len=maxlen,
+               num_blocks=num_blocks,
+               embedding_dim=hidden_units,
+               attention_dim=hidden_units,
+               attention_num_heads=num_heads,
+               dropout_rate=dropout_rate,
+               conv_dims=[100, 100],
+               l2_reg=l2_emb,
+               num_neg_test=num_neg_test
+               )
 
-    # 使用 tensorboard方便记录训练过程
-    log_dir = "./logs/fit/" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=log_dir)
+sampler = WarpSampler(data.user_train, data.usernum, data.itemnum, batch_size=batch_size, maxlen=maxlen, n_workers=3)
 
-    # early stopping
-    early_stopping = tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=3, restore_best_weights=True)
+with Timer() as train_time:
+    t_test = model.train(data, sampler, num_epochs=num_epochs, batch_size=batch_size, lr=lr, val_epoch=6)
 
-    # 模型训练
-    model = BoostingMoE(num_items, embed_dim, num_heads, num_layers, num_experts=2)
+print('Time cost for training is {0:.2f} mins'.format(train_time.interval / 60.0))
 
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(1e-3),
-        loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
-        metrics=["accuracy"],
-    )
+res_syn = {"ndcg@10": t_test[0], "Hit@10": t_test[1]}
+print(res_syn)
 
-    model.fit(
-        train_dataset,
-        validation_data=val_dataset,
-        epochs=30,
-        callbacks=[tensorboard_callback, early_stopping],
-    )
 
-    evaluate_metrics = model.evaluate(test_dataset)
-    print(evaluate_metrics)
-
-    predictions = model.predict(test_dataset)
-    print(predictions)
-
-    model.summary()

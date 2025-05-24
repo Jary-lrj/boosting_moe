@@ -1,50 +1,109 @@
-import pandas as pd
-import numpy as np
-import tensorflow as tf
-from neg_sampler import NegativeSampler
+# Copyright (c) Recommenders contributors.
+# Licensed under the MIT License.
+
+from collections import defaultdict
 
 
-def build_sequence(data_path, length=51, num_negatives=5, item_num=22885):
-    data = pd.read_csv(data_path)
+class SASRecDataSet:
+    """
+    A class for creating SASRec specific dataset used during
+    train, validation and testing.
 
-    # 1. 预处理和排序
-    data = data.sort_values(by=["userId", "timestamp"])
-    data = data[["userId", "movieId", "rating"]]
+    Attributes:
+        usernum: integer, total number of users
+        itemnum: integer, total number of items
+        User: dict, all the users (keys) with items as values
+        Items: set of all the items
+        user_train: dict, subset of User that are used for training
+        user_valid: dict, subset of User that are used for validation
+        user_test: dict, subset of User that are used for testing
+        col_sep: column separator in the data file
+        filename: data filename
+    """
 
-    # 2. 过滤评分和活跃用户
-    data = data[data["rating"] > 3]
-    data = data.groupby("userId").filter(lambda x: len(x) >= 5)
+    def __init__(self, **kwargs):
+        self.usernum = 0
+        self.itemnum = 0
+        self.User = defaultdict(list)
+        self.Items = set()
+        self.user_train = {}
+        self.user_valid = {}
+        self.user_test = {}
+        self.col_sep = kwargs.get("col_sep", " ")
+        self.filename = kwargs.get("filename", None)
 
-    # 3. 编号 movieId，0 用作 padding
-    movieId_list = data["movieId"].unique()
-    movieId_map = {mid: idx + 1 for idx, mid in enumerate(movieId_list)}  # 从 1 开始，0 保留给 padding
-    data["movieId"] = data["movieId"].map(movieId_map)
+        if self.filename:
+            with open(self.filename, "r") as fr:
+                sample = fr.readline()
+            ncols = len(sample.strip().split(self.col_sep))
+            if ncols == 3:
+                self.with_time = True
+            elif ncols == 2:
+                self.with_time = False
+            else:
+                raise ValueError(f"3 or 2 columns must be in dataset. Given {ncols} columns")
 
-    # 4. 构建序列（每个用户一条，按时间顺序）
-    user_sequence = []
-    for userId, group in data.groupby("userId"):
-        seq = group["movieId"].values[:length]
-        user_sequence.append(seq)
+    def split(self, **kwargs):
+        self.filename = kwargs.get("filename", self.filename)
+        if not self.filename:
+            raise ValueError("Filename is required")
 
-    # 5. 用 0 在前方 padding，统一长度
-    user_sequence = tf.keras.preprocessing.sequence.pad_sequences(user_sequence, maxlen=length, padding="pre", value=0)
+        if self.with_time:
+            self.data_partition_with_time()
+        else:
+            self.data_partition()
 
-    # 6. 构建输入和标签
-    inputs = user_sequence[:, :-1]  # shape: (num_users, length - 1)
-    labels = user_sequence[:, -1]  # shape: (num_users,)
+    def data_partition(self):
+        # assume user/item index starting from 1
+        f = open(self.filename, "r")
+        for line in f:
+            u, i = line.rstrip().split(self.col_sep)
+            u = int(u)
+            i = int(i)
+            self.usernum = max(u, self.usernum)
+            self.itemnum = max(i, self.itemnum)
+            self.User[u].append(i)
 
-    # 构建用户历史（用于负采样时排除）
-    user_histories = [set(seq) - {0} for seq in inputs]  # 去掉 padding 0
-    sampler = NegativeSampler(item_num=item_num - 1, num_negatives=num_negatives)  # -1 是因为 0 是 padding
-    neg_samples = sampler.sample(user_histories, labels)  # shape: (batch_size, num_negatives)
+        for user in self.User:
+            nfeedback = len(self.User[user])
+            if nfeedback < 3:
+                self.user_train[user] = self.User[user]
+                self.user_valid[user] = []
+                self.user_test[user] = []
+            else:
+                self.user_train[user] = self.User[user][:-2]
+                self.user_valid[user] = []
+                self.user_valid[user].append(self.User[user][-2])
+                self.user_test[user] = []
+                self.user_test[user].append(self.User[user][-1])
 
-    # 让inputs和labels成为张量
-    inputs = tf.convert_to_tensor(inputs, dtype=tf.int32)
-    labels = tf.convert_to_tensor(labels, dtype=tf.int32)
+    def data_partition_with_time(self):
+        # assume user/item index starting from 1
+        f = open(self.filename, "r")
+        for line in f:
+            u, i, t = line.rstrip().split(self.col_sep)
+            u = int(u)
+            i = int(i)
+            t = float(t)
+            self.usernum = max(u, self.usernum)
+            self.itemnum = max(i, self.itemnum)
+            self.User[u].append((i, t))
+            self.Items.add(i)
 
-    return inputs, labels, neg_samples
-
-
-if __name__ == "__main__":
-    data_path = "./versions/1/rating.csv"
-    inputs, labels = build_sequence(data_path)
+        for user in self.User.keys():
+            # sort by time
+            items = sorted(self.User[user], key=lambda x: x[1])
+            # keep only the items
+            items = [x[0] for x in items]
+            self.User[user] = items
+            nfeedback = len(self.User[user])
+            if nfeedback < 3:
+                self.user_train[user] = self.User[user]
+                self.user_valid[user] = []
+                self.user_test[user] = []
+            else:
+                self.user_train[user] = self.User[user][:-2]
+                self.user_valid[user] = []
+                self.user_valid[user].append(self.User[user][-2])
+                self.user_test[user] = []
+                self.user_test[user].append(self.User[user][-1])
