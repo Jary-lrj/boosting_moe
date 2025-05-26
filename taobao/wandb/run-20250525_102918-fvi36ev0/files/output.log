@@ -1,0 +1,10 @@
+data loaded success
+model init success
+Datasets initialize success
+Dataloaders initialized success
+Training model...
+Training epoch 1/10
+Evaluating model...
+Test Done.
+Epoch 1 | Train Loss: 0.0001 | Valid Loss: 2.0822 | Valid AUC: 0.5007 | Valid CTR: 0.4975 | Valid True CTR: 0.0504 | Elapsed Time: 144.99s
+Evaluating model...

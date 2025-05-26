@@ -4,7 +4,9 @@ from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score
+import numpy as np
 import time
+import wandb
 
 
 # ---------- Dataset ----------
@@ -75,6 +77,7 @@ class CTRMLPModel(nn.Module):
 
 # ---------- Training ----------
 def train():
+    print("Loading data...")
     df = pd.read_csv("processed_train.csv")
 
     # Embedding范围
@@ -82,20 +85,17 @@ def train():
     num_ads = df["adgroup_id_enc"].max()
     num_pids = df["pid_enc"].max()
 
-    # Split: train 80%, val 10%, test 10%
-    train_df, temp_df = train_test_split(df, test_size=0.2, random_state=42)
-    val_df, test_df = train_test_split(temp_df, test_size=0.5, random_state=42)
-
-    print(f"Train samples: {len(train_df)}")
-    print(f"Validation samples: {len(val_df)}")
-    print(f"Test samples: {len(test_df)}")
+    train_df = pd.read_csv("train_final.csv")
+    val_df = pd.read_csv("valid.csv")
+    test_df = pd.read_csv("test.csv")
 
     # Loaders
     train_loader = DataLoader(CTRDataset(train_df), batch_size=1024, shuffle=True)
-    val_loader = DataLoader(CTRDataset(val_df), batch_size=1024)
-    test_loader = DataLoader(CTRDataset(test_df), batch_size=1024)
+    val_loader = DataLoader(CTRDataset(val_df), batch_size=1024, shuffle=False)
+    test_loader = DataLoader(CTRDataset(test_df), batch_size=1024, shuffle=False)
 
     # Model setup
+    print("Initializing model...")
     model = CTRMLPModel(num_users, num_ads, num_pids)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -103,8 +103,10 @@ def train():
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     criterion = nn.BCELoss()
 
+    print("Starting training...")
     # Training loop
     for epoch in range(10):
+        print(f"Training Epoch {epoch + 1}/{10}")
         model.train()
         start_time = time.time()
         total_loss = 0.0
@@ -122,6 +124,7 @@ def train():
 
         epoch_time = time.time() - start_time  # End timing
         print(f"Epoch {epoch+1} | Train Loss: {total_loss:.4f} | Time: {epoch_time:.2f}s")
+        wandb.log({"train_loss": total_loss, "epoch_time": epoch_time})
 
         # Validation AUC
         model.eval()
@@ -133,8 +136,13 @@ def train():
                 y_preds.extend(y_pred.cpu().numpy())
                 y_trues.extend(batch[-1].cpu().numpy())
 
+        val_predicted_ctr = np.mean(y_preds)
+        val_real_ctr = np.mean(y_trues)
+        print(f"Val Predicted CTR: {val_predicted_ctr:.4f} | Val Real CTR: {val_real_ctr:.4f}")
+        wandb.log({"val_predicted_ctr": val_predicted_ctr, "val_real_ctr": val_real_ctr})
         val_auc = roc_auc_score(y_trues, y_preds)
-        print(f"📊 Validation AUC: {val_auc:.4f}")
+        print(f"Validation AUC: {val_auc:.4f}")
+        wandb.log({"val_auc": val_auc})
 
     # Test Set Evaluation
     model.eval()
@@ -146,9 +154,15 @@ def train():
             y_preds.extend(y_pred.cpu().numpy())
             y_trues.extend(batch[-1].cpu().numpy())
 
+    test_predicted_ctr = np.mean(y_preds)
+    test_real_ctr = np.mean(y_trues)
+    print(f"Predicted CTR: {test_predicted_ctr:.4f} | Real CTR: {test_real_ctr:.4f}")
+    wandb.log({"test_predicted_ctr": test_predicted_ctr, "test_real_ctr": test_real_ctr})
     test_auc = roc_auc_score(y_trues, y_preds)
     print(f"Final Test AUC: {test_auc:.4f}")
+    wandb.log({"test_auc": test_auc})
 
 
 if __name__ == "__main__":
+    wandb.init(project="SASRec", name="MLP")
     train()

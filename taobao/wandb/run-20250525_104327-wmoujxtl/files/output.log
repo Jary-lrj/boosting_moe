@@ -1,0 +1,48 @@
+data loaded success
+model init success
+Datasets initialize success
+Dataloaders initialized success
+Training epoch 1/10
+Evaluating model...
+Test Done.
+Epoch 1 | Train Loss: 0.3313 | Valid Loss: 0.2538 | Valid AUC: 0.5331 | Valid CTR: 0.1001 | Valid True CTR: 0.0504 | Elapsed Time: 2174.87s
+Training epoch 2/10
+Evaluating model...
+Test Done.
+Epoch 2 | Train Loss: 0.2260 | Valid Loss: 0.2395 | Valid AUC: 0.5442 | Valid CTR: 0.0843 | Valid True CTR: 0.0504 | Elapsed Time: 2177.66s
+Training epoch 3/10
+Evaluating model...
+Test Done.
+Epoch 3 | Train Loss: 0.2153 | Valid Loss: 0.2350 | Valid AUC: 0.5676 | Valid CTR: 0.0897 | Valid True CTR: 0.0504 | Elapsed Time: 2145.83s
+Training epoch 4/10
+Evaluating model...
+Test Done.
+Epoch 4 | Train Loss: 0.2074 | Valid Loss: 0.2347 | Valid AUC: 0.5822 | Valid CTR: 0.0840 | Valid True CTR: 0.0504 | Elapsed Time: 2156.59s
+Training epoch 5/10
+Evaluating model...
+Test Done.
+Epoch 5 | Train Loss: 0.2018 | Valid Loss: 0.2371 | Valid AUC: 0.5847 | Valid CTR: 0.0896 | Valid True CTR: 0.0504 | Elapsed Time: 2152.80s
+Training epoch 6/10
+Evaluating model...
+Test Done.
+Epoch 6 | Train Loss: 0.1964 | Valid Loss: 0.2414 | Valid AUC: 0.5867 | Valid CTR: 0.0853 | Valid True CTR: 0.0504 | Elapsed Time: 2141.68s
+Training epoch 7/10
+Evaluating model...
+Test Done.
+Epoch 7 | Train Loss: 0.1898 | Valid Loss: 0.2479 | Valid AUC: 0.5788 | Valid CTR: 0.1052 | Valid True CTR: 0.0504 | Elapsed Time: 2154.34s
+Training epoch 8/10
+Evaluating model...
+Test Done.
+Epoch 8 | Train Loss: 0.1824 | Valid Loss: 0.2573 | Valid AUC: 0.5838 | Valid CTR: 0.0833 | Valid True CTR: 0.0504 | Elapsed Time: 2117.36s
+Training epoch 9/10
+Evaluating model...
+Test Done.
+Epoch 9 | Train Loss: 0.1749 | Valid Loss: 0.2694 | Valid AUC: 0.5807 | Valid CTR: 0.1065 | Valid True CTR: 0.0504 | Elapsed Time: 2127.58s
+Training epoch 10/10
+Evaluating model...
+Test Done.
+Epoch 10 | Train Loss: 0.1678 | Valid Loss: 0.2776 | Valid AUC: 0.5792 | Valid CTR: 0.0964 | Valid True CTR: 0.0504 | Elapsed Time: 2186.12s
+Final test...
+Evaluating model...
+Test Done.
+Final test done.

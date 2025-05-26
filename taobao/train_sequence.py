@@ -10,6 +10,8 @@ from sklearn.metrics import roc_auc_score, roc_curve
 import matplotlib.pyplot as plt
 import time
 import wandb
+import random
+
 
 
 class Args:
@@ -35,7 +37,7 @@ class Args:
 
         # 学习参数
         self.lr = 1e-3
-        self.epochs = 3
+        self.epochs = 10
         self.batch_size = 1024
 
         # 设备自动检测
@@ -66,12 +68,13 @@ class ClassicFeedForward(torch.nn.Module):
 
 
 class CTRDataset(Dataset):
-    def __init__(self, csv_path, max_seq_len=50):
+    def __init__(self, csv_path, max_seq_len=50, num_negative_samples=1):
         self.max_seq_len = max_seq_len
+        self.num_negative_samples = num_negative_samples
 
         # 读取数据
         df = pd.read_csv(csv_path)
-
+        self.all_adgroup_ids = [int(ad) for ad in df["adgroup_id_enc"].unique()]
         # 构建用户历史点击序列
         self.user_hist = defaultdict(list)
         self.samples = []
@@ -103,6 +106,35 @@ class CTRDataset(Dataset):
                     "is_weekend": is_weekend,
                 }
             )
+
+            # 需要负采样
+            if label == 1 and self.num_negative_samples > 0:
+                items_to_avoid = set(self.user_hist[user_id])
+                items_to_avoid.add(adgroup_id) # 避免采样到当前正样本 item_id
+
+                potential_negative_candidates = [
+                    item for item in self.all_adgroup_ids if item not in items_to_avoid
+                ]
+
+                if len(potential_negative_candidates) > 0:
+                    num_to_sample = min(self.num_negative_samples, len(potential_negative_candidates))
+                    sampled_negative_adgroup_ids = random.sample(potential_negative_candidates, num_to_sample)
+
+                    for neg_item_id in sampled_negative_adgroup_ids:
+                        self.samples.append(
+                            {
+                                "user_id": user_id, # 用户相同
+                                "log_seq": hist_seq_before_current, # 历史序列相同
+                                "item_id": neg_item_id, # 负采样得到的 item_id
+                                "label": 0, # 负样本标签为0
+                                # 所有上下文特征 (包括 pid) 与原始正样本相同
+                                "pid": pid_context,
+                                "hour": hour_context,
+                                "dayofweek": dow_context,
+                                "hour_block": hour_block_context,
+                                "is_weekend": is_weekend_context,
+                            }
+                        )
 
             # 添加当前行为到用户历史
             if label == 1:  # 仅将正样本加入历史（模拟点击序列）
@@ -356,17 +388,12 @@ def train_model(model, train_loader, valid_loader, test_loader, args):
                 # forward
                 logits = model(user_id, log_seq, item_id, pid, hour, dow, hour_block, is_weekend)
                 loss = criterion(logits.view(-1), label.view(-1))
-
                 optimizers[expert_idx].zero_grad()
                 loss.backward()
                 optimizers[expert_idx].step()
-
                 total_loss += loss.item()
-                print(
-                    f"Epoch {epoch} | Expert {expert_idx + 1} | Batch {i + 1}/{len(train_loader)} | Loss: {loss.item():.4f}"
-                )
-            # 计算平均损失
 
+            # 计算平均损失
             train_loss = total_loss / len(train_loader)
             # evaluate
             valid_loss, valid_auc, valid_ctr, valid_true_ctr = evaluate(model, valid_loader, criterion, args)
@@ -433,33 +460,27 @@ def evaluate(model, data_loader, criterion, args):
 
 if __name__ == "__main__":
 
-    # 初始化 wandb
-    wandb.init(project="SASRec", name="boostingmoe-v2.2-debug:cpu")
+    wandb.init(project="SASRec", name="boostingmoe-negasample=1")
     config = wandb.config
 
-    # 读取数据
     df = pd.read_csv("processed_train.csv")
     args = Args(df)
     config = args.__dict__
     print("data loaded success")
 
-    # 初始化模型
     model = SASRec(args.user_num, args.item_num, args).to(args.device)
-    criterion = torch.nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     print("model init success")
 
-    # CTRDataset 接收两个参数：csv路径和最大序列长度
-    train_dataset = CTRDataset("train_final.csv", max_seq_len=args.maxlen)
-    val_dataset = CTRDataset("valid.csv", max_seq_len=args.maxlen)
-    test_dataset = CTRDataset("test.csv", max_seq_len=args.maxlen)
-    print("Datasets initialized with time-split files")
+    train_dataset = CTRDataset("train_final.csv", max_seq_len=args.maxlen, num_negative_samples=1)
+    val_dataset = CTRDataset("valid.csv", max_seq_len=args.maxlen, num_negative_samples=1)
+    test_dataset = CTRDataset("test.csv", max_seq_len=args.maxlen, num_negative_samples=1)
+    print("Datasets initialize success")
 
     # 构建 DataLoader
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
-    print("Dataloaders initialized successfully")
+    print("Dataloaders initialized success")
 
     # 训练模型
     wandb.watch(model, log="all")

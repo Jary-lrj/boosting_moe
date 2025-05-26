@@ -1,0 +1,45 @@
+Loading data...
+Initializing model...
+Starting training...
+Training Epoch 1/10
+Epoch 1 | Train Loss: 4114.5861 | Time: 1198.81s
+Val Predicted CTR: 0.0592 | Val Real CTR: 0.0504
+Validation AUC: 0.6030
+Training Epoch 2/10
+Epoch 2 | Train Loss: 3939.4484 | Time: 1285.55s
+Val Predicted CTR: 0.0583 | Val Real CTR: 0.0504
+Validation AUC: 0.6182
+Training Epoch 3/10
+Epoch 3 | Train Loss: 3844.4643 | Time: 1286.42s
+Val Predicted CTR: 0.0605 | Val Real CTR: 0.0504
+Validation AUC: 0.6192
+Training Epoch 4/10
+Epoch 4 | Train Loss: 3786.1891 | Time: 1307.88s
+Val Predicted CTR: 0.0661 | Val Real CTR: 0.0504
+Validation AUC: 0.6179
+Training Epoch 5/10
+Epoch 5 | Train Loss: 3739.3204 | Time: 1271.74s
+Val Predicted CTR: 0.0663 | Val Real CTR: 0.0504
+Validation AUC: 0.6159
+Training Epoch 6/10
+Epoch 6 | Train Loss: 3688.2272 | Time: 1241.87s
+Val Predicted CTR: 0.0746 | Val Real CTR: 0.0504
+Validation AUC: 0.6116
+Training Epoch 7/10
+Epoch 7 | Train Loss: 3623.3223 | Time: 1263.78s
+Val Predicted CTR: 0.0753 | Val Real CTR: 0.0504
+Validation AUC: 0.6084
+Training Epoch 8/10
+Epoch 8 | Train Loss: 3546.1066 | Time: 1251.12s
+Val Predicted CTR: 0.0863 | Val Real CTR: 0.0504
+Validation AUC: 0.6042
+Training Epoch 9/10
+Epoch 9 | Train Loss: 3459.4750 | Time: 1232.04s
+Val Predicted CTR: 0.0953 | Val Real CTR: 0.0504
+Validation AUC: 0.6008
+Training Epoch 10/10
+Epoch 10 | Train Loss: 3363.0755 | Time: 1244.17s
+Val Predicted CTR: 0.1034 | Val Real CTR: 0.0504
+Validation AUC: 0.5992
+Predicted CTR: 0.0664 | Real CTR: 0.0516
+Final Test AUC: 0.6215
