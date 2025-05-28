@@ -47,6 +47,8 @@ class Args:
         self.epochs = 10
         self.batch_size = 1024
 
+        self.patience = 5  # 早停耐心
+        self.weight_decay = 1e-5  # 权重衰减
         # 设备自动检测
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -347,12 +349,12 @@ class SASRec(torch.nn.Module):
                 torch.nn.MultiheadAttention(args.hidden_units, args.num_heads, args.dropout_rate)
             )
             self.forward_layernorms.append(torch.nn.LayerNorm(args.hidden_units, eps=1e-8))
-            # self.forward_layers.append(
-            #     SparseBoostingMoE(
-            #         args.hidden_units, args.num_experts, args.hidden_units, args.top_k, args.alpha, args.dropout_rate
-            #     )
-            # )
-            self.forward_layers.append(ClassicFeedForward(args.hidden_units, args.dropout_rate))
+            self.forward_layers.append(
+                SparseBoostingMoE(
+                    args.hidden_units, args.num_experts, args.hidden_units, args.top_k, args.alpha, args.dropout_rate
+                )
+            )
+            # self.forward_layers.append(ClassicFeedForward(args.hidden_units, args.dropout_rate))
 
     def log2feats(self, log_seqs):
         seqs = self.item_emb(log_seqs.to(self.dev))
@@ -404,10 +406,23 @@ class SASRec(torch.nn.Module):
         return logits  # 直接传入 BCEWithLogitsLoss
 
 
-def train_model(model, train_loader, valid_loader, test_loader, args):
+def train_model(model, train_loader, valid_loader, test_loader, args, exp_name):
     print("Training model...")
     criterion = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    # 确保优化器包含 weight_decay，如果 Args 中没有，可以在这里添加
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+    )  # <-- 添加 weight_decay
+
+    # ==================== 早停相关变量 ====================
+    best_valid_loss = float("inf")  # 记录迄今为止最好的验证损失
+    best_epoch = 0  # 记录最佳验证损失所在的 epoch
+    patience_counter = 0  # 记录验证损失没有改善的 epoch 数量
+    # best_model_state = None          # 用于保存最佳模型的状态字典
+    # ====================================================
+
+    # 在训练开始前，设置一个模型保存路径
+    model_save_path = f"best_model_{exp_name}.pth"
 
     for epoch in range(1, args.epochs + 1):
 
@@ -432,14 +447,22 @@ def train_model(model, train_loader, valid_loader, test_loader, args):
             loss = criterion(logits.view(-1), label.view(-1))
             optimizer.zero_grad()
             loss.backward()
+
+            # ==================== 梯度裁剪 ====================
+            if hasattr(args, "grad_clip_norm") and args.grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
+            # ====================================================
+
             optimizer.step()
             total_loss += loss.item()
 
-        # 计算平均损失
+        # 计算平均训练损失
         train_loss = total_loss / len(train_loader)
-        # evaluate
+
+        # evaluate on validation set
         valid_loss, valid_auc, valid_ctr, valid_true_ctr = evaluate(model, valid_loader, criterion, args)
         elapsed = time.time() - start_time
+
         print(
             f"Epoch {epoch} | Train Loss: {train_loss:.4f} | Valid Loss: {valid_loss:.4f} | Valid AUC: {valid_auc:.4f} | "
             f"Valid CTR: {valid_ctr:.4f} | Valid True CTR: {valid_true_ctr:.4f} | Elapsed Time: {elapsed:.2f}s"
@@ -454,10 +477,42 @@ def train_model(model, train_loader, valid_loader, test_loader, args):
                 "elapsed_time": elapsed,
             }
         )
-    # 最终测试
+
+        # ==================== 早停逻辑 ====================
+        # 通常我们希望验证损失越小越好，所以是寻找最小损失
+        if valid_loss < best_valid_loss:
+            best_valid_loss = valid_loss
+            best_epoch = epoch
+            # best_model_state = model.state_dict() # 保存当前最佳模型的状态
+            torch.save(model.state_dict(), model_save_path)  # 直接保存到文件，避免内存占用过高
+            patience_counter = 0  # 重置耐心计数器
+            print(f"  --> Valid Loss improved. Saving model to {model_save_path}")
+        else:
+            patience_counter += 1
+            print(f"  --> Valid Loss did not improve. Patience: {patience_counter}/{args.patience}")
+
+        if patience_counter >= args.patience:
+            print(f"Early stopping triggered! No improvement for {args.patience} epochs.")
+            print(f"Best Valid Loss: {best_valid_loss:.4f} at Epoch {best_epoch}")
+            break  # 停止训练循环
+        # ====================================================
+
+    # 最终测试：加载最佳模型进行测试
     print("Final test...")
+    # 确保加载了最佳模型
+    if "model_save_path" in locals() and torch.cuda.is_available():  # 检查路径变量是否存在且CUDA可用
+        model.load_state_dict(torch.load(model_save_path))
+    elif "model_save_path" in locals():  # 如果没有CUDA，或者模型在CPU上训练
+        model.load_state_dict(torch.load(model_save_path, map_location=torch.device("cpu")))
+    else:
+        print("Warning: No best model saved or path not found. Testing with the last trained model.")
+        # 如果没有保存最佳模型，则使用最后一个epoch的模型进行测试
+
     test_loss, test_auc, test_ctr, test_true_ctr = evaluate(model, test_loader, criterion, args)
     wandb.log({"test_loss": test_loss, "test_auc": test_auc, "test_ctr": test_ctr, "test_true_ctr": test_true_ctr})
+    print(
+        f"Final Test Loss: {test_loss:.4f} | Test AUC: {test_auc:.4f} | Test CTR: {test_ctr:.4f} | Test True CTR: {test_true_ctr:.4f}"
+    )
     print("Final test done.")
 
 
@@ -501,7 +556,9 @@ def evaluate(model, data_loader, criterion, args):
 
 
 if __name__ == "__main__":
-    wandb.init(project="SASRec", name="sasrec-original-v2")
+
+    exp_name = "boosting_weight_decay_1e-5"  # 实验名称
+    wandb.init(project="SASRec", name=exp_name)
     config = wandb.config
 
     df = pd.read_csv("processed_train.csv")
@@ -567,4 +624,4 @@ if __name__ == "__main__":
 
     # 训练模型
     wandb.watch(model, log="all")
-    train_model(model, train_loader, valid_loader, test_loader, args)
+    train_model(model, train_loader, valid_loader, test_loader, args, exp_name=exp_name)

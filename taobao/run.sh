@@ -1,1 +1,1 @@
-nohup python train_sequence.py > logs/taobao/sasrec-original-v2.log 2>&1 &
+nohup python train_sequence.py > logs/taobao/boosting_weightdecay_1e-5.log 2>&1 &
