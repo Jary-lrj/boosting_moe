@@ -1,7 +1,0 @@
-{"time":"2025-05-25T10:29:18.735939148+08:00","level":"INFO","msg":"stream: starting","core version":"0.19.11","symlink path":"/root/autodl-tmp/users/liruijie/code/boosting_moe/taobao/wandb/run-20250525_102918-fvi36ev0/logs/debug-core.log"}
-{"time":"2025-05-25T10:29:19.269598329+08:00","level":"INFO","msg":"created new stream","id":"fvi36ev0"}
-{"time":"2025-05-25T10:29:19.269697058+08:00","level":"INFO","msg":"stream: started","id":"fvi36ev0"}
-{"time":"2025-05-25T10:29:19.269765097+08:00","level":"INFO","msg":"sender: started","stream_id":"fvi36ev0"}
-{"time":"2025-05-25T10:29:19.269767997+08:00","level":"INFO","msg":"writer: Do: started","stream_id":"fvi36ev0"}
-{"time":"2025-05-25T10:29:19.269909594+08:00","level":"INFO","msg":"handler: started","stream_id":"fvi36ev0"}
-{"time":"2025-05-25T10:29:19.641854423+08:00","level":"INFO","msg":"Starting system monitor"}

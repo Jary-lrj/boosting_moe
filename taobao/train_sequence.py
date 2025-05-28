@@ -4,14 +4,13 @@ import torch.nn.functional as F
 import numpy as np
 import torch.nn.init as init
 import pandas as pd
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 from collections import defaultdict
 from sklearn.metrics import roc_auc_score, roc_curve
 import matplotlib.pyplot as plt
 import time
 import wandb
 import random
-
 
 
 class Args:
@@ -28,12 +27,20 @@ class Args:
         self.dropout_rate = 0.1
         self.maxlen = 10  # 用户历史序列长度
 
+        # 数据集相关
+        self.data_name = "ad"
+        self.train_file = "train.csv"
+        self.valid_file = "valid.csv"
+        self.test_file = "test.csv"
+
         # MoE 相关
         self.num_experts = 4
         self.alpha = 0.1
+        self.top_k = 4
 
         # 上下文特征 embedding 尺寸
         self.context_emb_dim = 8
+        self.negative_samples = 0  # 负采样数量
 
         # 学习参数
         self.lr = 1e-3
@@ -68,91 +75,74 @@ class ClassicFeedForward(torch.nn.Module):
 
 
 class CTRDataset(Dataset):
-    def __init__(self, csv_path, max_seq_len=50, num_negative_samples=1):
+    def __init__(
+        self, csv_path, all_adgroup_ids=None, max_seq_len=50, num_negative_samples=0, split="train", user_histories=None
+    ):
+
         self.max_seq_len = max_seq_len
         self.num_negative_samples = num_negative_samples
-
-        # 读取数据
-        df = pd.read_csv(csv_path)
-        self.all_adgroup_ids = [int(ad) for ad in df["adgroup_id_enc"].unique()]
-        # 构建用户历史点击序列
-        self.user_hist = defaultdict(list)
+        self.split = split
         self.samples = []
+        self.user_current_histories = {}  # 用于存储当前阶段结束后，用户最新的历史
 
-        for row in df.itertuples(index=False):
-            user_id = row.user_id_enc
-            adgroup_id = row.adgroup_id_enc
-            label = row.label
+        df = pd.read_csv(csv_path)
+        self.all_adgroup_ids = all_adgroup_ids or df["adgroup_id_enc"].unique().tolist()
 
-            pid = row.pid_enc
-            hour = row.hour
-            dow = row.dayofweek
-            hour_block = row.hour_block
-            is_weekend = row.is_weekend
+        # 如果提供了历史记录，则使用它作为初始历史。对字典进行深拷贝以防修改原始传入的字典
+        initial_user_histories = {k: v.copy() for k, v in (user_histories or {}).items()}
 
-            # 当前历史序列（复制）
-            hist_seq = self.user_hist[user_id][-self.max_seq_len :]
+        for user_id, user_df in df.groupby("user_id_enc"):
+            # 获取该用户的初始历史（如果存在），或者从空列表开始
+            hist_seq = initial_user_histories.get(user_id, []).copy()
 
-            self.samples.append(
-                {
+            for _, row in user_df.iterrows():
+                adgroup_id = row["adgroup_id_enc"]
+                label = row["label"]
+
+                sample = {
                     "user_id": user_id,
-                    "log_seq": hist_seq.copy(),
+                    "log_seq": hist_seq[-self.max_seq_len :].copy(),
                     "item_id": adgroup_id,
                     "label": label,
-                    "pid": pid,
-                    "hour": hour,
-                    "dayofweek": dow,
-                    "hour_block": hour_block,
-                    "is_weekend": is_weekend,
+                    "pid": row["pid_enc"],
+                    "hour": row["hour"],
+                    "dayofweek": row["dayofweek"],
+                    "hour_block": row["hour_block"],
+                    "is_weekend": row["is_weekend"],
                 }
-            )
+                self.samples.append(sample)
 
-            # 需要负采样
-            if label == 1 and self.num_negative_samples > 0:
-                items_to_avoid = set(self.user_hist[user_id])
-                items_to_avoid.add(adgroup_id) # 避免采样到当前正样本 item_id
+                # 只有真实点击才加入历史序列
+                if label == 1:
+                    # 负采样逻辑
+                    if self.split in ["train", "valid"] and self.num_negative_samples > 0:
+                        items_to_avoid = set(hist_seq + [adgroup_id])  # 避免采样已交互或当前点击的
+                        neg_candidates = list(set(self.all_adgroup_ids) - items_to_avoid)
+                        if neg_candidates:
+                            sampled_neg = random.sample(
+                                neg_candidates, min(self.num_negative_samples, len(neg_candidates))
+                            )
+                            for neg_id in sampled_neg:
+                                neg_sample = sample.copy()
+                                neg_sample["item_id"] = neg_id
+                                neg_sample["label"] = 0
+                                self.samples.append(neg_sample)
 
-                potential_negative_candidates = [
-                    item for item in self.all_adgroup_ids if item not in items_to_avoid
-                ]
+                    hist_seq.append(adgroup_id)  # 将当前点击的item加入历史序列
 
-                if len(potential_negative_candidates) > 0:
-                    num_to_sample = min(self.num_negative_samples, len(potential_negative_candidates))
-                    sampled_negative_adgroup_ids = random.sample(potential_negative_candidates, num_to_sample)
-
-                    for neg_item_id in sampled_negative_adgroup_ids:
-                        self.samples.append(
-                            {
-                                "user_id": user_id, # 用户相同
-                                "log_seq": hist_seq_before_current, # 历史序列相同
-                                "item_id": neg_item_id, # 负采样得到的 item_id
-                                "label": 0, # 负样本标签为0
-                                # 所有上下文特征 (包括 pid) 与原始正样本相同
-                                "pid": pid_context,
-                                "hour": hour_context,
-                                "dayofweek": dow_context,
-                                "hour_block": hour_block_context,
-                                "is_weekend": is_weekend_context,
-                            }
-                        )
-
-            # 添加当前行为到用户历史
-            if label == 1:  # 仅将正样本加入历史（模拟点击序列）
-                self.user_hist[user_id].append(adgroup_id)
+            # 在处理完一个用户的所有记录后，将该用户的最终历史存储起来
+            self.user_current_histories[user_id] = hist_seq
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
         data = self.samples[idx]
-
         log_seq = data["log_seq"]
         pad_len = self.max_seq_len - len(log_seq)
         if pad_len > 0:
-            # 左侧 padding（用 0 补齐）
             log_seq = [0] * pad_len + log_seq
         else:
-            # 截断（只保留 max_seq_len）
             log_seq = log_seq[-self.max_seq_len :]
 
         return {
@@ -256,9 +246,67 @@ class BoostingMoE(nn.Module):
         return self.layer_norm(residual + fused)
 
 
-# pls use the following self-made multihead attention layer
-# in case your pytorch version is below 1.16 or for other reasons
-# https://github.com/pmixer/TiSASRec.pytorch/blob/master/model.py
+class SparseBoostingMoE(nn.Module):
+    def __init__(self, hidden_units, num_experts, expert_hidden_dim, top_k=1, alpha=0.5, dropout=0.1):
+        super(SparseBoostingMoE, self).__init__()
+
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.hidden_units = hidden_units
+        self.expert_hidden_dim = expert_hidden_dim
+        self.alpha = alpha
+
+        self.experts = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(hidden_units, expert_hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(expert_hidden_dim, hidden_units),
+                    nn.Dropout(dropout),
+                )
+                for _ in range(num_experts)
+            ]
+        )
+
+        self.gate = nn.Linear(hidden_units, num_experts)
+        self.layer_norm = nn.LayerNorm(hidden_units)
+
+    def forward(self, x):
+        residual = x
+        B, L, D = x.size()
+        gate_logits = self.gate(x)  # (B, L, E)
+        gate_weights = F.softmax(gate_logits, dim=-1)  # (B, L, E)
+        topk_vals, topk_indices = torch.topk(gate_weights, self.top_k, dim=-1)  # (B, L, k)
+        boost_input = x.detach()
+        stacked_outputs = []
+
+        for i in range(self.top_k):
+            expert_idx = topk_indices[:, :, i]  # (B, L)
+            expert_out = self._forward_selected_expert(boost_input, expert_idx)  # (B, L, D)
+            if i < self.top_k - 1:
+                boost_input = boost_input + self.alpha * expert_out.detach()
+            else:
+                boost_input = boost_input + self.alpha * expert_out
+            stacked_outputs.append(expert_out)
+
+        fused = sum(topk_vals[:, :, i].unsqueeze(-1) * stacked_outputs[i] for i in range(self.top_k))
+        return self.layer_norm(residual + fused)
+
+    def _forward_selected_expert(self, x, expert_indices):
+        B, L, D = x.size()
+        out = torch.zeros_like(x)
+
+        for expert_id in range(self.num_experts):
+            mask = expert_indices == expert_id  # (B, L)
+            if mask.sum() == 0:
+                continue
+
+            masked_x = x[mask]  # (N_selected, D)
+            masked_out = self.experts[expert_id](masked_x)  # (N_selected, D)
+            out[mask] = masked_out
+
+        return out
 
 
 class SASRec(torch.nn.Module):
@@ -299,10 +347,12 @@ class SASRec(torch.nn.Module):
                 torch.nn.MultiheadAttention(args.hidden_units, args.num_heads, args.dropout_rate)
             )
             self.forward_layernorms.append(torch.nn.LayerNorm(args.hidden_units, eps=1e-8))
-            self.forward_layers.append(
-                BoostingMoE(args.hidden_units, args.num_experts, args.hidden_units, args.alpha, args.dropout_rate)
-            )
-            # self.forward_layers.append(ClassicFeedForward(args.hidden_units, args.dropout_rate))
+            # self.forward_layers.append(
+            #     SparseBoostingMoE(
+            #         args.hidden_units, args.num_experts, args.hidden_units, args.top_k, args.alpha, args.dropout_rate
+            #     )
+            # )
+            self.forward_layers.append(ClassicFeedForward(args.hidden_units, args.dropout_rate))
 
     def log2feats(self, log_seqs):
         seqs = self.item_emb(log_seqs.to(self.dev))
@@ -357,66 +407,58 @@ class SASRec(torch.nn.Module):
 def train_model(model, train_loader, valid_loader, test_loader, args):
     print("Training model...")
     criterion = nn.BCEWithLogitsLoss()
-    optimizers = [
-        torch.optim.Adam(model.parameters(), lr=args.lr) for _ in range(args.num_experts)
-    ]  # 每个专家一个优化器
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     for epoch in range(1, args.epochs + 1):
-        # 设置当前训练的专家索引
-        for expert_idx in range(args.num_experts):
 
-            for fwd_layer in model.forward_layers:
-                fwd_layer.set_expert_idx(expert_idx)
-            print(f"Epoch {epoch} Training expert {expert_idx + 1}/{args.num_experts}")
+        model.train()
+        start_time = time.time()
+        total_loss = 0
 
-            model.train()
-            start_time = time.time()
-            total_loss = 0
+        for i, batch in enumerate(train_loader):
+            # unpack batch
+            user_id = batch["user_id"].to(args.device)
+            log_seq = batch["log_seq"].to(args.device)
+            item_id = batch["item_id"].to(args.device)
+            label = batch["label"].float().to(args.device)
+            pid = batch["pid"].to(args.device)
+            hour = batch["hour"].to(args.device)
+            dow = batch["dayofweek"].to(args.device)
+            hour_block = batch["hour_block"].to(args.device)
+            is_weekend = batch["is_weekend"].to(args.device)
 
-            for i, batch in enumerate(train_loader):
-                # unpack batch
-                user_id = batch["user_id"].to(args.device)
-                log_seq = batch["log_seq"].to(args.device)
-                item_id = batch["item_id"].to(args.device)
-                label = batch["label"].float().to(args.device)
-                pid = batch["pid"].to(args.device)
-                hour = batch["hour"].to(args.device)
-                dow = batch["dayofweek"].to(args.device)
-                hour_block = batch["hour_block"].to(args.device)
-                is_weekend = batch["is_weekend"].to(args.device)
+            # forward
+            logits = model(user_id, log_seq, item_id, pid, hour, dow, hour_block, is_weekend)
+            loss = criterion(logits.view(-1), label.view(-1))
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
 
-                # forward
-                logits = model(user_id, log_seq, item_id, pid, hour, dow, hour_block, is_weekend)
-                loss = criterion(logits.view(-1), label.view(-1))
-                optimizers[expert_idx].zero_grad()
-                loss.backward()
-                optimizers[expert_idx].step()
-                total_loss += loss.item()
-
-            # 计算平均损失
-            train_loss = total_loss / len(train_loader)
-            # evaluate
-            valid_loss, valid_auc, valid_ctr, valid_true_ctr = evaluate(model, valid_loader, criterion, args)
-            elapsed = time.time() - start_time
-            print(
-                f"Epoch {epoch} | Expert {expert_idx + 1} | Train Loss: {train_loss:.4f} | Valid Loss: {valid_loss:.4f} | Valid AUC: {valid_auc:.4f} | "
-                f"Valid CTR: {valid_ctr:.4f} | Valid True CTR: {valid_true_ctr:.4f} | Elapsed Time: {elapsed:.2f}s"
-            )
-            wandb.log(
-                {
-                    "train_loss": train_loss,
-                    "valid_loss": valid_loss,
-                    "valid_auc": valid_auc,
-                    "valid_ctr": valid_ctr,
-                    "valid_true_ctr": valid_true_ctr,
-                    "elapsed_time": elapsed,
-                }
-            )
-        # 最终测试结果 + 绘图
-        print("Final test...")
-        test_loss, test_auc, test_ctr, test_true_ctr = evaluate(model, test_loader, criterion, args)
-        wandb.log({"test_loss": test_loss, "test_auc": test_auc, "test_ctr": test_ctr, "test_true_ctr": test_true_ctr})
-        print("Final test done.")
+        # 计算平均损失
+        train_loss = total_loss / len(train_loader)
+        # evaluate
+        valid_loss, valid_auc, valid_ctr, valid_true_ctr = evaluate(model, valid_loader, criterion, args)
+        elapsed = time.time() - start_time
+        print(
+            f"Epoch {epoch} | Train Loss: {train_loss:.4f} | Valid Loss: {valid_loss:.4f} | Valid AUC: {valid_auc:.4f} | "
+            f"Valid CTR: {valid_ctr:.4f} | Valid True CTR: {valid_true_ctr:.4f} | Elapsed Time: {elapsed:.2f}s"
+        )
+        wandb.log(
+            {
+                "train_loss": train_loss,
+                "valid_loss": valid_loss,
+                "valid_auc": valid_auc,
+                "valid_ctr": valid_ctr,
+                "valid_true_ctr": valid_true_ctr,
+                "elapsed_time": elapsed,
+            }
+        )
+    # 最终测试
+    print("Final test...")
+    test_loss, test_auc, test_ctr, test_true_ctr = evaluate(model, test_loader, criterion, args)
+    wandb.log({"test_loss": test_loss, "test_auc": test_auc, "test_ctr": test_ctr, "test_true_ctr": test_true_ctr})
+    print("Final test done.")
 
 
 def evaluate(model, data_loader, criterion, args):
@@ -459,8 +501,7 @@ def evaluate(model, data_loader, criterion, args):
 
 
 if __name__ == "__main__":
-
-    wandb.init(project="SASRec", name="boostingmoe-negasample=1")
+    wandb.init(project="SASRec", name="sasrec-original-v2")
     config = wandb.config
 
     df = pd.read_csv("processed_train.csv")
@@ -471,17 +512,59 @@ if __name__ == "__main__":
     model = SASRec(args.user_num, args.item_num, args).to(args.device)
     print("model init success")
 
-    train_dataset = CTRDataset("train_final.csv", max_seq_len=args.maxlen, num_negative_samples=1)
-    val_dataset = CTRDataset("valid.csv", max_seq_len=args.maxlen, num_negative_samples=1)
-    test_dataset = CTRDataset("test.csv", max_seq_len=args.maxlen, num_negative_samples=1)
-    print("Datasets initialize success")
+    data_dir = f"data/ad"
+    all_adgroup_ids = pd.read_csv(f"{data_dir}/train.csv")["adgroup_id_enc"].unique().tolist()
 
-    # 构建 DataLoader
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
-    print("Dataloaders initialized success")
+    # 初始化一个空的字典来累积用户的历史
+    current_user_histories = {}
+
+    # 1. 构建训练集 Dataset (1-6天)
+    print("Building train dataset (Days 1-6)...")
+    train_dataset = CTRDataset(
+        csv_path=f"{data_dir}/train.csv",
+        all_adgroup_ids=all_adgroup_ids,  # 负采样空间只用训练集物品
+        max_seq_len=args.maxlen,
+        num_negative_samples=args.negative_samples,
+        split="train",
+        user_histories=current_user_histories,
+    )
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    print(f"Train dataset size: {len(train_dataset)}")
+
+    # 更新历史：将训练集生成的用户历史保存下来，供后续数据集使用
+    current_user_histories.update(train_dataset.user_current_histories)
+    print(f"User histories after train data: {len(current_user_histories)} users.")
+
+    # 3. 构建验证集 Dataset，传入训练集历史
+    print("Building validation dataset with train histories (Day 7)...")
+    valid_dataset = CTRDataset(
+        csv_path=f"{data_dir}/valid.csv",
+        all_adgroup_ids=all_adgroup_ids,
+        max_seq_len=args.maxlen,
+        num_negative_samples=args.negative_samples,
+        split="valid",
+        user_histories=current_user_histories,
+    )
+    valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False)
+    print(f"Validation dataset size: {len(valid_dataset)}")
+
+    # 再次更新历史：将第7天的点击也加入到历史中，以便测试集使用
+    current_user_histories.update(valid_dataset.user_current_histories)
+    print(f"User histories after valid data: {len(current_user_histories)} users.")
+
+    # 4. 构建测试集 Dataset，传入训练集历史
+    print("Building test dataset with train histories (Day 8)...")
+    test_dataset = CTRDataset(
+        csv_path=f"{data_dir}/test.csv",
+        all_adgroup_ids=None,
+        max_seq_len=args.maxlen,
+        num_negative_samples=args.negative_samples,
+        split="test",
+        user_histories=current_user_histories,
+    )
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
+    print(f"Test dataset size: {len(test_dataset)}")
 
     # 训练模型
     wandb.watch(model, log="all")
-    train_model(model, train_loader, val_loader, test_loader, args)
+    train_model(model, train_loader, valid_loader, test_loader, args)

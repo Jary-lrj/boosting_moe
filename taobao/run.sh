@@ -1,0 +1,1 @@
+nohup python train_sequence.py > logs/taobao/sasrec-original-v2.log 2>&1 &
