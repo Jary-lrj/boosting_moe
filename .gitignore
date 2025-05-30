@@ -1,3 +1,6 @@
 versions/
 taobao/*.csv
-taobao/*.log
+taobao/logs/*
+taobao/data/*
+avito/*.csv
+criteo/*.csv

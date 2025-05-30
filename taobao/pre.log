@@ -1,0 +1,23 @@
+nohup: ignoring input
+Unique users: 1141729, Unique items: 846811
+Traceback (most recent call last):
+  File "/root/autodl-tmp/users/liruijie/code/boosting_moe/taobao/preprocessing.py", line 57, in <module>
+    generate_datasets_from_csv("raw_sample.csv")
+  File "/root/autodl-tmp/users/liruijie/code/boosting_moe/taobao/preprocessing.py", line 49, in generate_datasets_from_csv
+    train_df.to_csv("train.csv", index=False)
+  File "/root/autodl-tmp/users/liruijie/anaconda3/envs/VimCnnTrans/lib/python3.10/site-packages/pandas/util/_decorators.py", line 333, in wrapper
+    return func(*args, **kwargs)
+  File "/root/autodl-tmp/users/liruijie/anaconda3/envs/VimCnnTrans/lib/python3.10/site-packages/pandas/core/generic.py", line 3967, in to_csv
+    return DataFrameRenderer(formatter).to_csv(
+  File "/root/autodl-tmp/users/liruijie/anaconda3/envs/VimCnnTrans/lib/python3.10/site-packages/pandas/io/formats/format.py", line 1014, in to_csv
+    csv_formatter.save()
+  File "/root/autodl-tmp/users/liruijie/anaconda3/envs/VimCnnTrans/lib/python3.10/site-packages/pandas/io/formats/csvs.py", line 270, in save
+    self._save()
+  File "/root/autodl-tmp/users/liruijie/anaconda3/envs/VimCnnTrans/lib/python3.10/site-packages/pandas/io/formats/csvs.py", line 275, in _save
+    self._save_body()
+  File "/root/autodl-tmp/users/liruijie/anaconda3/envs/VimCnnTrans/lib/python3.10/site-packages/pandas/io/formats/csvs.py", line 313, in _save_body
+    self._save_chunk(start_i, end_i)
+  File "/root/autodl-tmp/users/liruijie/anaconda3/envs/VimCnnTrans/lib/python3.10/site-packages/pandas/io/formats/csvs.py", line 324, in _save_chunk
+    libwriters.write_csv_rows(
+  File "writers.pyx", line 73, in pandas._libs.writers.write_csv_rows
+OSError: [Errno 28] No space left on device

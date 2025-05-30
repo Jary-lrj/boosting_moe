@@ -16,15 +16,14 @@ import random
 class Args:
     def __init__(self, df: pd.DataFrame):
         # 自动从 DataFrame 推断特征规模
-        self.user_num = df["user_id_enc"].max()
-        self.item_num = df["adgroup_id_enc"].max()
-        self.pid_size = df["pid_enc"].max()  # 若 pid 从 0 开始，+1 保证包含
+        self.user_num = 1141729
+        self.item_num = 846811
 
         # 模型结构参数
         self.hidden_units = 64
         self.num_blocks = 2
         self.num_heads = 1
-        self.dropout_rate = 0.1
+        self.dropout_rate = 0.2
         self.maxlen = 10  # 用户历史序列长度
 
         # 数据集相关
@@ -48,7 +47,7 @@ class Args:
         self.batch_size = 1024
 
         self.patience = 5  # 早停耐心
-        self.weight_decay = 1e-5  # 权重衰减
+        self.weight_decay = 1e-6  # 权重衰减
         # 设备自动检测
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -77,87 +76,112 @@ class ClassicFeedForward(torch.nn.Module):
 
 
 class CTRDataset(Dataset):
-    def __init__(
-        self, csv_path, all_adgroup_ids=None, max_seq_len=50, num_negative_samples=0, split="train", user_histories=None
-    ):
+    def __init__(self, csv_file, max_seq_len=50):
+        """
+        csv_file: csv 文件路径，包含 user_id, log_seq, adgroup_id, clk
+        max_seq_len: 对log_seq做截断或padding的最大长度
+        """
+        import pandas as pd
 
+        self.data = pd.read_csv(csv_file)
+        self.data["log_seq"] = self.data["log_seq"].fillna("").astype(str)
         self.max_seq_len = max_seq_len
-        self.num_negative_samples = num_negative_samples
-        self.split = split
-        self.samples = []
-        self.user_current_histories = {}  # 用于存储当前阶段结束后，用户最新的历史
-
-        df = pd.read_csv(csv_path)
-        self.all_adgroup_ids = all_adgroup_ids or df["adgroup_id_enc"].unique().tolist()
-
-        # 如果提供了历史记录，则使用它作为初始历史。对字典进行深拷贝以防修改原始传入的字典
-        initial_user_histories = {k: v.copy() for k, v in (user_histories or {}).items()}
-
-        for user_id, user_df in df.groupby("user_id_enc"):
-            # 获取该用户的初始历史（如果存在），或者从空列表开始
-            hist_seq = initial_user_histories.get(user_id, []).copy()
-
-            for _, row in user_df.iterrows():
-                adgroup_id = row["adgroup_id_enc"]
-                label = row["label"]
-
-                sample = {
-                    "user_id": user_id,
-                    "log_seq": hist_seq[-self.max_seq_len :].copy(),
-                    "item_id": adgroup_id,
-                    "label": label,
-                    "pid": row["pid_enc"],
-                    "hour": row["hour"],
-                    "dayofweek": row["dayofweek"],
-                    "hour_block": row["hour_block"],
-                    "is_weekend": row["is_weekend"],
-                }
-                self.samples.append(sample)
-
-                # 只有真实点击才加入历史序列
-                if label == 1:
-                    # 负采样逻辑
-                    if self.split in ["train", "valid"] and self.num_negative_samples > 0:
-                        items_to_avoid = set(hist_seq + [adgroup_id])  # 避免采样已交互或当前点击的
-                        neg_candidates = list(set(self.all_adgroup_ids) - items_to_avoid)
-                        if neg_candidates:
-                            sampled_neg = random.sample(
-                                neg_candidates, min(self.num_negative_samples, len(neg_candidates))
-                            )
-                            for neg_id in sampled_neg:
-                                neg_sample = sample.copy()
-                                neg_sample["item_id"] = neg_id
-                                neg_sample["label"] = 0
-                                self.samples.append(neg_sample)
-
-                    hist_seq.append(adgroup_id)  # 将当前点击的item加入历史序列
-
-            # 在处理完一个用户的所有记录后，将该用户的最终历史存储起来
-            self.user_current_histories[user_id] = hist_seq
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.data)
 
     def __getitem__(self, idx):
-        data = self.samples[idx]
-        log_seq = data["log_seq"]
-        pad_len = self.max_seq_len - len(log_seq)
-        if pad_len > 0:
-            log_seq = [0] * pad_len + log_seq
-        else:
-            log_seq = log_seq[-self.max_seq_len :]
+        row = self.data.iloc[idx]
+        user_id = row["user"]
+        adgroup_id = row["adgroup_id"]
+        label = row["clk"]
 
-        return {
-            "user_id": torch.tensor(data["user_id"], dtype=torch.long),
-            "log_seq": torch.tensor(log_seq, dtype=torch.long),
-            "item_id": torch.tensor(data["item_id"], dtype=torch.long),
-            "label": torch.tensor(data["label"], dtype=torch.float),
-            "pid": torch.tensor(data["pid"], dtype=torch.long),
-            "hour": torch.tensor(data["hour"], dtype=torch.long),
-            "dayofweek": torch.tensor(data["dayofweek"], dtype=torch.long),
-            "hour_block": torch.tensor(data["hour_block"], dtype=torch.long),
-            "is_weekend": torch.tensor(data["is_weekend"], dtype=torch.long),
+        # log_seq存储为字符串，用逗号分隔，转为list[int]
+        if row["log_seq"] == "":
+            seq = []
+        else:
+            seq = list(map(int, row["log_seq"].split(",")))
+
+        # 截断或padding到 max_seq_len，左侧padding 0
+        if len(seq) > self.max_seq_len:
+            seq = seq[-self.max_seq_len :]
+        else:
+            seq = [0] * (self.max_seq_len - len(seq)) + seq
+
+        sample = {
+            "user_id": torch.tensor(user_id, dtype=torch.long),
+            "log_seq": torch.tensor(seq, dtype=torch.long),
+            "adgroup_id": torch.tensor(adgroup_id, dtype=torch.long),
+            "clk": torch.tensor(label, dtype=torch.float),
         }
+        return sample
+
+
+class SparseMoE(nn.Module):
+    def __init__(self, hidden_units, num_experts, expert_hidden_dim, top_k=2, dropout=0.1):
+
+        super(SparseMoE, self).__init__()
+
+        self.num_experts = num_experts
+        self.hidden_units = hidden_units
+        self.expert_hidden_dim = expert_hidden_dim
+        self.top_k = min(top_k, num_experts)  # 确保top_k不超过专家数量
+
+        # 专家网络：每个专家是一个两层FFN
+        self.experts = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(hidden_units, expert_hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(expert_hidden_dim, hidden_units),
+                    nn.Dropout(dropout),
+                )
+                for _ in range(num_experts)
+            ]  # 4*2*64*256+64*4=
+        )
+
+        self.gate = nn.Linear(hidden_units, num_experts)
+
+        self.layer_norm = nn.LayerNorm(hidden_units)
+
+    def forward(self, x):
+
+        batch_size, seq_len, _ = x.size()
+
+        # 门控网络计算专家权重
+        gate_logits = self.gate(x)  # 形状：(batch_size, seq_len, num_experts)
+
+        # 选择top-k专家
+        top_k_weights, top_k_indices = torch.topk(gate_logits, k=self.top_k, dim=-1)
+        top_k_weights = F.softmax(top_k_weights, dim=-1)  # 归一化top-k权重
+        # top_k_weights 形状：(batch_size, seq_len, top_k)
+        # top_k_indices 形状：(batch_size, seq_len, top_k)
+
+        # 初始化输出张量
+        output = torch.zeros_like(x)  # 形状：(batch_size, seq_len, hidden_units)
+
+        # 计算top-k专家的输出（优化为批量操作）
+        for k in range(self.top_k):
+            # 获取当前专家索引和权重
+            expert_idx = top_k_indices[:, :, k]  # 形状：(batch_size, seq_len)
+            expert_weight = top_k_weights[:, :, k].unsqueeze(-1)  # 形状：(batch_size, seq_len, 1)
+
+            # 创建掩码，标记每个位置的专家输出
+            expert_output = torch.zeros_like(x)  # 形状：(batch_size, seq_len, hidden_units)
+            for idx in range(self.num_experts):
+                mask = (expert_idx == idx).unsqueeze(-1)  # 形状：(batch_size, seq_len, 1)
+                if mask.any():
+                    # 只计算选中专家的输出
+                    expert_output += mask.float() * self.experts[idx](x)  # 广播计算
+
+            # 加权累加到输出
+            output += expert_weight * expert_output
+
+        # 残差连接和LayerNorm
+        output = self.layer_norm(x + output)
+
+        return output
 
 
 class BoostingMoE(nn.Module):
@@ -311,7 +335,7 @@ class SparseBoostingMoE(nn.Module):
         return out
 
 
-class SASRec(torch.nn.Module):
+class SASRec(nn.Module):
     def __init__(self, user_num, item_num, args):
         super(SASRec, self).__init__()
 
@@ -319,42 +343,32 @@ class SASRec(torch.nn.Module):
         self.item_num = item_num
         self.dev = args.device
 
-        self.item_emb = torch.nn.Embedding(self.item_num + 1, args.hidden_units, padding_idx=0)
-        self.pos_emb = torch.nn.Embedding(args.maxlen + 1, args.hidden_units, padding_idx=0)
+        self.item_emb = nn.Embedding(self.item_num + 1, args.hidden_units, padding_idx=0)
+        self.pos_emb = nn.Embedding(args.maxlen + 1, args.hidden_units, padding_idx=0)
+        self.user_emb = nn.Embedding(self.user_num + 1, args.hidden_units, padding_idx=0)
 
-        # 上下文特征
-        self.user_emb = torch.nn.Embedding(user_num + 1, args.context_emb_dim, padding_idx=0)
-        self.pid_emb = torch.nn.Embedding(args.pid_size + 1, args.context_emb_dim, padding_idx=0)
-        self.hour_emb = torch.nn.Embedding(24, args.context_emb_dim)
-        self.dow_emb = torch.nn.Embedding(7, args.context_emb_dim)
-        self.hour_block_emb = torch.nn.Embedding(4, args.context_emb_dim)
-        self.is_weekend_emb = torch.nn.Embedding(2, args.context_emb_dim)
+        self.emb_dropout = nn.Dropout(p=args.dropout_rate)
 
-        # 融合线性层：把 context + final_feat -> 投影到 hidden_units
-        concat_dim = args.hidden_units + 6 * args.context_emb_dim
-        self.fusion_layer = torch.nn.Linear(concat_dim, args.hidden_units)
+        self.attention_layernorms = nn.ModuleList()
+        self.attention_layers = nn.ModuleList()
+        self.forward_layernorms = nn.ModuleList()
+        self.forward_layers = nn.ModuleList()
 
-        self.emb_dropout = torch.nn.Dropout(p=args.dropout_rate)
-
-        self.attention_layernorms = torch.nn.ModuleList()
-        self.attention_layers = torch.nn.ModuleList()
-        self.forward_layernorms = torch.nn.ModuleList()
-        self.forward_layers = torch.nn.ModuleList()
-
-        self.last_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
+        self.last_layernorm = nn.LayerNorm(args.hidden_units, eps=1e-8)
 
         for _ in range(args.num_blocks):
-            self.attention_layernorms.append(torch.nn.LayerNorm(args.hidden_units, eps=1e-8))
-            self.attention_layers.append(
-                torch.nn.MultiheadAttention(args.hidden_units, args.num_heads, args.dropout_rate)
-            )
-            self.forward_layernorms.append(torch.nn.LayerNorm(args.hidden_units, eps=1e-8))
-            self.forward_layers.append(
-                SparseBoostingMoE(
-                    args.hidden_units, args.num_experts, args.hidden_units, args.top_k, args.alpha, args.dropout_rate
-                )
-            )
+            self.attention_layernorms.append(nn.LayerNorm(args.hidden_units, eps=1e-8))
+            self.attention_layers.append(nn.MultiheadAttention(args.hidden_units, args.num_heads, args.dropout_rate))
+            self.forward_layernorms.append(nn.LayerNorm(args.hidden_units, eps=1e-8))
+            # self.forward_layers.append(
+            #     SparseBoostingMoE(
+            #         args.hidden_units, args.num_experts, args.hidden_units, args.top_k, args.alpha, args.dropout_rate
+            #     )
+            # )
             # self.forward_layers.append(ClassicFeedForward(args.hidden_units, args.dropout_rate))
+            self.forward_layers.append(
+                SparseMoE(args.hidden_units, args.num_experts, args.hidden_units, args.top_k, args.dropout_rate)
+            )
 
     def log2feats(self, log_seqs):
         seqs = self.item_emb(log_seqs.to(self.dev))
@@ -381,29 +395,16 @@ class SASRec(torch.nn.Module):
         log_feats = self.last_layernorm(seqs)
         return log_feats
 
-    def forward(self, user_ids, log_seqs, item_ids, pid, hour, dow, hour_block, is_weekend):
+    def forward(self, user_ids, log_seqs, item_ids):
+
         log_feats = self.log2feats(log_seqs)
-        final_feat = log_feats[:, -1, :]  # (B, H)
-
-        # 获取上下文特征 embedding
-        context_embs = torch.cat(
-            [
-                self.user_emb(user_ids.to(self.dev)).squeeze(1),
-                self.pid_emb(pid.to(self.dev)).squeeze(1),
-                self.hour_emb(hour.to(self.dev)).squeeze(1),
-                self.dow_emb(dow.to(self.dev)).squeeze(1),
-                self.hour_block_emb(hour_block.to(self.dev)).squeeze(1),
-                self.is_weekend_emb(is_weekend.to(self.dev)).squeeze(1),
-            ],
-            dim=-1,
-        )
-
-        fused_feat = self.fusion_layer(torch.cat([final_feat, context_embs], dim=-1))  # (B, H)
-
+        final_feat = log_feats[:, -1, :]
+        user_emb = self.user_emb(user_ids.to(self.dev))
+        combined_feat = final_feat + user_emb
         item_emb = self.item_emb(item_ids.to(self.dev))
-        logits = (fused_feat * item_emb).sum(dim=-1)  # 点积
+        logits = (combined_feat * item_emb).sum(dim=-1)
 
-        return logits  # 直接传入 BCEWithLogitsLoss
+        return logits
 
 
 def train_model(model, train_loader, valid_loader, test_loader, args, exp_name):
@@ -432,26 +433,19 @@ def train_model(model, train_loader, valid_loader, test_loader, args, exp_name):
 
         for i, batch in enumerate(train_loader):
             # unpack batch
-            user_id = batch["user_id"].to(args.device)
+            user_id = batch["user"].to(args.device)
             log_seq = batch["log_seq"].to(args.device)
-            item_id = batch["item_id"].to(args.device)
-            label = batch["label"].float().to(args.device)
-            pid = batch["pid"].to(args.device)
-            hour = batch["hour"].to(args.device)
-            dow = batch["dayofweek"].to(args.device)
-            hour_block = batch["hour_block"].to(args.device)
-            is_weekend = batch["is_weekend"].to(args.device)
+            adgroup_id = batch["adgroup_id"].to(args.device)
+            label = batch["clk"].float().to(args.device)
 
             # forward
-            logits = model(user_id, log_seq, item_id, pid, hour, dow, hour_block, is_weekend)
+            logits = model(user_id, log_seq, adgroup_id)
             loss = criterion(logits.view(-1), label.view(-1))
             optimizer.zero_grad()
             loss.backward()
 
-            # ==================== 梯度裁剪 ====================
             if hasattr(args, "grad_clip_norm") and args.grad_clip_norm > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
-            # ====================================================
 
             optimizer.step()
             total_loss += loss.item()
@@ -460,20 +454,17 @@ def train_model(model, train_loader, valid_loader, test_loader, args, exp_name):
         train_loss = total_loss / len(train_loader)
 
         # evaluate on validation set
-        valid_loss, valid_auc, valid_ctr, valid_true_ctr = evaluate(model, valid_loader, criterion, args)
+        valid_loss, valid_auc = evaluate(model, valid_loader, criterion, args)
         elapsed = time.time() - start_time
 
         print(
-            f"Epoch {epoch} | Train Loss: {train_loss:.4f} | Valid Loss: {valid_loss:.4f} | Valid AUC: {valid_auc:.4f} | "
-            f"Valid CTR: {valid_ctr:.4f} | Valid True CTR: {valid_true_ctr:.4f} | Elapsed Time: {elapsed:.2f}s"
+            f"Epoch {epoch} | Train Loss: {train_loss:.4f} | Valid Loss: {valid_loss:.4f} | Valid AUC: {valid_auc:.4f} | Elapsed Time: {elapsed:.2f}s"
         )
         wandb.log(
             {
                 "train_loss": train_loss,
                 "valid_loss": valid_loss,
                 "valid_auc": valid_auc,
-                "valid_ctr": valid_ctr,
-                "valid_true_ctr": valid_true_ctr,
                 "elapsed_time": elapsed,
             }
         )
@@ -508,11 +499,9 @@ def train_model(model, train_loader, valid_loader, test_loader, args, exp_name):
         print("Warning: No best model saved or path not found. Testing with the last trained model.")
         # 如果没有保存最佳模型，则使用最后一个epoch的模型进行测试
 
-    test_loss, test_auc, test_ctr, test_true_ctr = evaluate(model, test_loader, criterion, args)
-    wandb.log({"test_loss": test_loss, "test_auc": test_auc, "test_ctr": test_ctr, "test_true_ctr": test_true_ctr})
-    print(
-        f"Final Test Loss: {test_loss:.4f} | Test AUC: {test_auc:.4f} | Test CTR: {test_ctr:.4f} | Test True CTR: {test_true_ctr:.4f}"
-    )
+    test_loss, test_auc = evaluate(model, test_loader, criterion, args)
+    wandb.log({"test_loss": test_loss, "test_auc": test_auc})
+    print(f"Final Test Loss: {test_loss:.4f} | Test AUC: {test_auc:.4f}")
     print("Final test done.")
 
 
@@ -527,15 +516,10 @@ def evaluate(model, data_loader, criterion, args):
         for batch in data_loader:
             user_id = batch["user_id"].to(args.device)
             log_seq = batch["log_seq"].to(args.device)
-            item_id = batch["item_id"].to(args.device)
+            adgroup_id = batch["adgroup_id"].to(args.device)
             label = batch["label"].float().to(args.device)
-            pid = batch["pid"].to(args.device)
-            hour = batch["hour"].to(args.device)
-            dow = batch["dayofweek"].to(args.device)
-            hour_block = batch["hour_block"].to(args.device)
-            is_weekend = batch["is_weekend"].to(args.device)
 
-            logits = model(user_id, log_seq, item_id, pid, hour, dow, hour_block, is_weekend)
+            logits = model(user_id, log_seq, adgroup_id)
             loss = criterion(logits.view(-1), label.view(-1))
             total_loss += loss.item()
 
@@ -547,17 +531,13 @@ def evaluate(model, data_loader, criterion, args):
     # 计算 AUC
     auc = roc_auc_score(all_labels, all_probs)
 
-    # CTR 计算
-    predicted_ctr = sum(all_probs) / len(all_probs)
-    actual_ctr = sum(all_labels) / len(all_labels)
-
     print("Test Done.")
-    return total_loss / len(data_loader), auc, predicted_ctr, actual_ctr
+    return total_loss / len(data_loader), auc
 
 
 if __name__ == "__main__":
 
-    exp_name = "boosting_weight_decay_1e-5"  # 实验名称
+    exp_name = "boosting_sasrec_1e-6_dr_0.2.log"  # 实验名称
     wandb.init(project="SASRec", name=exp_name)
     config = wandb.config
 
