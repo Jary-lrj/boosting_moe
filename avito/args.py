@@ -5,7 +5,7 @@ class Args:
     def __init__(self):
         self.user_num = 771769
         self.item_num = 1503424
-        self.name = "avito_sparse_moe_k=2"
+        self.name = "avito_boostingmoe"
 
         # 模型结构参数
         self.hidden_units = 64
@@ -22,8 +22,8 @@ class Args:
 
         # MoE 相关
         self.num_experts = 4
-        self.alpha = 0.1
-        self.top_k = 1
+        self.alpha = 1
+        self.top_k = 2
 
         # 上下文特征 embedding 尺寸
         self.context_emb_dim = 8
@@ -31,7 +31,7 @@ class Args:
 
         # 学习参数
         self.lr = 1e-3
-        self.epochs = 10
+        self.epochs = 50
         self.batch_size = 1024
 
         self.patience = 5  # 早停耐心

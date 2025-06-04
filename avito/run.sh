@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICE=1 nohup python main.py >> log.txt 2>&1 &

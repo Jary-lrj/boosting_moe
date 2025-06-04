@@ -221,42 +221,33 @@ class SparseBoostingMoE(Module):
 
         self.gate = Linear(hidden_units, num_experts)
         self.layer_norm = LayerNorm(hidden_units)
+        self.tau = 1.0  # 温度参数，用于控制Gumbel-Softmax的平滑度
 
     def forward(self, x):
         residual = x
-        B, L, D = x.size()
-        gate_logits = self.gate(x)  # (B, L, E)
-        gate_weights = F.softmax(gate_logits, dim=-1)  # (B, L, E)
-        topk_vals, topk_indices = torch.topk(gate_weights, self.top_k, dim=-1)  # (B, L, k)
-        boost_input = x.detach()
-        stacked_outputs = []
+        boost_input = x
+        expert_outputs = []
 
         for i in range(self.top_k):
-            expert_idx = topk_indices[:, :, i]  # (B, L)
-            expert_out = self._forward_selected_expert(boost_input, expert_idx)  # (B, L, D)
+            gate_logits = self.gate(boost_input)
+
+            gumbel_noise = -torch.empty_like(gate_logits).exponential_().log()
+            y = (gate_logits + gumbel_noise) / self.tau
+            gate_weights = F.softmax(y, dim=-1)  # (B, L, E)
+
+            expert_out = torch.zeros_like(x)
+            for expert_id, expert in enumerate(self.experts):
+                expert_result = expert(boost_input)
+                expert_out += gate_weights[..., expert_id].unsqueeze(-1) * expert_result
+
+            # Boost residual
             if i < self.top_k - 1:
                 boost_input = boost_input + self.alpha * expert_out.detach()
             else:
                 boost_input = boost_input + self.alpha * expert_out
-            stacked_outputs.append(expert_out)
 
-        fused = sum(topk_vals[:, :, i].unsqueeze(-1) * stacked_outputs[i] for i in range(self.top_k))
-        return self.layer_norm(residual + fused)
-
-    def _forward_selected_expert(self, x, expert_indices):
-        B, L, D = x.size()
-        out = torch.zeros_like(x)
-
-        for expert_id in range(self.num_experts):
-            mask = expert_indices == expert_id  # (B, L)
-            if mask.sum() == 0:
-                continue
-
-            masked_x = x[mask]  # (N_selected, D)
-            masked_out = self.experts[expert_id](masked_x)  # (N_selected, D)
-            out[mask] = masked_out
-
-        return out
+            expert_outputs.append(expert_out)
+            return self.layer_norm(residual + boost_input), expert_outputs
 
 
 class SASRec(Module):
@@ -284,17 +275,45 @@ class SASRec(Module):
             self.attention_layernorms.append(LayerNorm(args.hidden_units, eps=1e-8))
             self.attention_layers.append(MultiheadAttention(args.hidden_units, args.num_heads, args.dropout_rate))
             self.forward_layernorms.append(LayerNorm(args.hidden_units, eps=1e-8))
-            # self.forward_layers.append(
-            #     SparseBoostingMoE(
-            #         args.hidden_units, args.num_experts, args.hidden_units, args.top_k, args.alpha, args.dropout_rate
-            #     )
-            # )
-            # self.forward_layers.append(ClassicFeedForward(args.hidden_units, args.dropout_rate))
             self.forward_layers.append(
-                SparseMoE(args.hidden_units, args.num_experts, args.hidden_units, args.top_k, args.dropout_rate)
+                SparseBoostingMoE(
+                    args.hidden_units, args.num_experts, args.hidden_units, args.top_k, args.alpha, args.dropout_rate
+                )
             )
+            # self.forward_layers.append(ClassicFeedForward(args.hidden_units, args.dropout_rate))
+            # self.forward_layers.append(
+            #     SparseMoE(args.hidden_units, args.num_experts, args.hidden_units, args.top_k, args.dropout_rate)
+            # )
 
     def log2feats(self, log_seqs):
+        all_layer_expert_outputs = []
+        seqs = self.item_emb(log_seqs.to(self.dev))
+        seqs *= self.item_emb.embedding_dim**0.5
+
+        poss = torch.arange(1, log_seqs.shape[1] + 1, device=self.dev).unsqueeze(0).repeat(log_seqs.shape[0], 1)
+        poss *= (log_seqs != 0).long().to(self.dev)
+        seqs += self.pos_emb(poss)
+
+        seqs = self.emb_dropout(seqs)
+        tl = seqs.shape[1]
+        attention_mask = ~torch.tril(torch.ones((tl, tl), dtype=torch.bool, device=self.dev))
+
+        for i in range(len(self.attention_layers)):
+            seqs = seqs.transpose(0, 1)
+            Q = self.attention_layernorms[i](seqs)
+            mha_outputs, _ = self.attention_layers[i](Q, seqs, seqs, attn_mask=attention_mask)
+            seqs = Q + mha_outputs
+            seqs = seqs.transpose(0, 1)
+
+            seqs = self.forward_layernorms[i](seqs)
+            seqs, expert_output = self.forward_layers[i](seqs)
+            all_layer_expert_outputs.append(expert_output)
+
+        log_feats = self.last_layernorm(seqs)
+        return log_feats, all_layer_expert_outputs
+
+    def log2feats_noboosting(self, log_seqs):
+        all_layer_expert_outputs = []
         seqs = self.item_emb(log_seqs.to(self.dev))
         seqs *= self.item_emb.embedding_dim**0.5
 
@@ -317,15 +336,16 @@ class SASRec(Module):
             seqs = self.forward_layers[i](seqs)
 
         log_feats = self.last_layernorm(seqs)
-        return log_feats
+        return log_feats, all_layer_expert_outputs
 
     def forward(self, user_ids, log_seqs, item_ids):
 
-        log_feats = self.log2feats(log_seqs)
+        log_feats, all_layer_expert_outputs = self.log2feats(log_seqs)
         final_feat = log_feats[:, -1, :]
         user_emb = self.user_emb(user_ids.to(self.dev))
         combined_feat = final_feat + user_emb
         item_emb = self.item_emb(item_ids.to(self.dev))
         logits = (combined_feat * item_emb).sum(dim=-1)
+        probs = torch.sigmoid(logits)
 
-        return logits
+        return probs, all_layer_expert_outputs
