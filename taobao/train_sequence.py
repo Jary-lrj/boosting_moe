@@ -11,13 +11,17 @@ import matplotlib.pyplot as plt
 import time
 import wandb
 import random
+import tqdm
+import pickle
+import os
+import json
 
 
 class Args:
     def __init__(self):
         # 自动从 DataFrame 推断特征规模
-        self.user_num = 1141729
-        self.item_num = 846811
+        self.user_num = 1210271
+        self.item_num = 249274
 
         # 模型结构参数
         self.hidden_units = 64
@@ -27,10 +31,10 @@ class Args:
         self.maxlen = 50  # 用户历史序列长度
 
         # 数据集相关
-        self.data_name = "ad"
-        self.train_file = "train_geq3.csv"
-        self.valid_file = "valid_geq3.csv"
-        self.test_file = "test_geq3.csv"
+        self.data_name = "beauty"
+        self.train_file = "train.csv"
+        self.valid_file = "valid.csv"
+        self.test_file = "test.csv"
 
         # MoE 相关
         self.num_experts = 4
@@ -75,46 +79,54 @@ class ClassicFeedForward(torch.nn.Module):
         return outputs
 
 
+class TransformerGate(nn.Module):
+    def __init__(self, hidden_dim=64, num_experts=4, num_heads=2):
+        super().__init__()
+        self.encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim, nhead=num_heads, dim_feedforward=hidden_dim * 2, batch_first=True
+        )
+        self.encoder = nn.TransformerEncoder(self.encoder_layer, num_layers=1)
+        self.output_proj = nn.Linear(hidden_dim, num_experts)  # 输出每个 token 对各专家的打分
+
+    def forward(self, x):  # x: (B, L, H)
+        h = self.encoder(x)  # (B, L, H)
+        logits = self.output_proj(h)  # (B, L, E)
+        return logits
+
+
 class TaobaoDataset(Dataset):
-    def __init__(
-        self, csv_path, all_adgroup_ids=None, max_seq_len=50, num_negative_samples=1, split="train", min_seq_len=1
-    ):
-        """
-        Args:
-            csv_path (str): 路径到 train.csv / valid.csv / test.csv
-            all_adgroup_ids (list): 所有训练集物品ID列表，用于负采样
-            max_seq_len (int): 序列最大长度
-            num_negative_samples (int): 每个正样本对应的负样本数量
-            split (str): ['train', 'valid', 'test']
-            min_seq_len (int): 最小序列长度，过滤太短的序列
-        """
+    def __init__(self, csv_path, cache_path=None, max_seq_len=50, split="train"):
         self.csv_path = csv_path
-        self.all_adgroup_ids = all_adgroup_ids if all_adgroup_ids else []
+        self.cache_path = cache_path or csv_path.replace(".csv", f"_{split}_cache.pkl")
         self.max_seq_len = max_seq_len
-        self.num_negative_samples = num_negative_samples
-        self.split = split
-        self.min_seq_len = min_seq_len
-
-        # 加载数据
-        df = pd.read_csv(csv_path)
-        df["log_seq"] = df["log_seq"].apply(lambda x: list(map(int, x.split(","))) if x else [])
-
-        # 构建样本
         self.samples = []
 
-        for _, row in df.iterrows():
-            user = row["user"]
-            log_seq = row["log_seq"]
-            target_item = row["adgroup_id"]
-            label = row["clk"]
+        if os.path.exists(self.cache_path):
+            print(f"[Cache] Loading samples from {self.cache_path} ...")
+            with open(self.cache_path, "rb") as f:
+                self.samples = pickle.load(f)
+        else:
+            print(f"[Build] Processing raw CSV: {csv_path}")
+            reader = pd.read_csv(csv_path, chunksize=500_000)
 
-            # 截断或填充序列
-            log_seq = log_seq[-self.max_seq_len :]
-            padding_len = self.max_seq_len - len(log_seq)
-            padded_log_seq = [0] * padding_len + log_seq  # 前补零
+            for chunk in reader:
+                for _, row in chunk.iterrows():
+                    log_seq = json.loads(row["log_seq"])
+                    log_seq = log_seq[-self.max_seq_len :]
+                    padded_seq = [0] * (self.max_seq_len - len(log_seq)) + log_seq
 
-            # 先不做负采样；
-            self.samples.append({"user": user, "log_seq": padded_log_seq, "target_item": target_item, "label": label})
+                    self.samples.append(
+                        {
+                            "user": int(row["user_id"]),
+                            "log_seq": padded_seq,
+                            "target_item": int(row["target_item"]),
+                            "label": int(row["clk"]),
+                        }
+                    )
+
+            with open(self.cache_path, "wb") as f:
+                pickle.dump(self.samples, f)
+            print(f"[Cache Saved] {self.cache_path}")
 
     def __len__(self):
         return len(self.samples)
@@ -122,10 +134,10 @@ class TaobaoDataset(Dataset):
     def __getitem__(self, idx):
         sample = self.samples[idx]
         return {
-            "user": torch.tensor(sample["user"], dtype=torch.long),  # int
-            "log_seq": torch.tensor(sample["log_seq"], dtype=torch.long),  # list of int
-            "target_item": torch.tensor(sample["target_item"], dtype=torch.long),  # int
-            "label": torch.tensor(sample["label"], dtype=torch.float),  # int
+            "user": torch.tensor(sample["user"], dtype=torch.long),
+            "log_seq": torch.tensor(sample["log_seq"], dtype=torch.long),
+            "target_item": torch.tensor(sample["target_item"], dtype=torch.long),
+            "label": torch.tensor(sample["label"], dtype=torch.float),
         }
 
 
@@ -304,17 +316,24 @@ class SparseBoostingMoE(nn.Module):
             ]
         )
 
-        self.gate = nn.Linear(hidden_units, num_experts)
+        self.gate = TransformerGate()
         self.layer_norm = nn.LayerNorm(hidden_units)
         self.tau = 1.0  # 温度参数，用于控制Gumbel-Softmax的平滑度
+        self.register_buffer("expert_ema_scores", torch.zeros(num_experts))
+        self.ema_decay = 0.99
 
     def forward(self, x):
         residual = x
         boost_input = x
+        batch_expert_scores = torch.zeros(self.num_experts, device=x.device)
         expert_outputs = []
 
         for i in range(self.top_k):
             gate_logits = self.gate(boost_input)  # (B, L, E)
+            gate_probs = F.softmax(gate_logits, dim=-1)  # (B, L, E)
+            entropy = -(gate_probs * gate_probs.log()).sum(dim=-1, keepdim=True)  # (B, L, 1)
+            # ema_scaled = self.expert_ema_scores.view(1, 1, -1)  # shape: (1,1,E)
+            gate_logits = gate_logits * entropy
 
             # --- Gumbel noise + temperature scaling ---
             gumbel_noise = -torch.empty_like(gate_logits).exponential_().log()
@@ -333,7 +352,15 @@ class SparseBoostingMoE(nn.Module):
             for expert_id, expert in enumerate(self.experts):
                 expert_result = expert(boost_input)  # (B, L, H)
                 weight = gate_weights[..., expert_id].unsqueeze(-1)  # (B, L, 1)
-                expert_out += weight * expert_result  # weighted sum
+                contribution = weight * expert_result
+                expert_out += contribution
+                # expert_contribution_norm = contribution.norm(p=2, dim=(-2, -1))  # 每个样本的贡献
+                # batch_expert_scores[expert_id] = expert_contribution_norm.mean()
+
+            # with torch.no_grad():  # 防止参与梯度传播
+            #     self.expert_ema_scores = (
+            #         self.ema_decay * self.expert_ema_scores + (1.0 - self.ema_decay) * batch_expert_scores
+            #     )
 
             # --- Boost residual ---
             if i < self.top_k - 1:
@@ -345,7 +372,12 @@ class SparseBoostingMoE(nn.Module):
 
         # Final residual connection and normalization
         output = self.layer_norm(residual + boost_input)
-        return output, expert_outputs
+        with torch.no_grad():
+            avg_gate_per_expert = gate_weights.mean(dim=(0, 1))  # (E,)
+            target_distribution = torch.full_like(avg_gate_per_expert, 1.0 / self.num_experts)
+            epsilon = 1e-8
+            kl_loss = F.kl_div((avg_gate_per_expert + epsilon).log(), target_distribution, reduction="batchmean")
+        return output, expert_outputs, kl_loss
 
 
 class SASRec(nn.Module):
@@ -405,24 +437,26 @@ class SASRec(nn.Module):
 
             seqs = self.forward_layernorms[i](seqs)
             # Regular Code
-            # seqs = self.forward_layers[i](seqs)
+            # seqs, _ = self.forward_layers[i](seqs)
             # Boosting Code
-            seqs, expert_output = self.forward_layers[i](seqs)
+            seqs, expert_output, kl_loss = self.forward_layers[i](seqs)
             all_layer_expert_outputs.append(expert_output)
 
         log_feats = self.last_layernorm(seqs)
-        return log_feats, all_layer_expert_outputs
+        # return log_feats
+        return log_feats, all_layer_expert_outputs, kl_loss
 
     def forward(self, user_ids, log_seqs, item_ids):
 
-        log_feats, all_layer_expert_outputs = self.log2feats(log_seqs)
+        # log_feats = self.log2feats(log_seqs)
+        log_feats, all_layer_expert_outputs, kl_loss = self.log2feats(log_seqs)
         final_feat = log_feats[:, -1, :]
         user_emb = self.user_emb(user_ids.to(self.dev))
         combined_feat = final_feat + user_emb
         item_emb = self.item_emb(item_ids.to(self.dev))
         logits = (combined_feat * item_emb).sum(dim=-1)
-
-        return logits, all_layer_expert_outputs
+        # return logits
+        return logits, all_layer_expert_outputs, kl_loss
 
 
 def train_model(model, train_loader, valid_loader, test_loader, args, exp_name):
@@ -458,17 +492,18 @@ def train_model(model, train_loader, valid_loader, test_loader, args, exp_name):
             label = batch["label"].float().to(args.device)
 
             # forward
-            logits, all_layer_experts_output = model(user_id, log_seq, adgroup_id)
+            logits, all_layer_experts_output, kl_loss = model(user_id, log_seq, adgroup_id)
+            # logits = model(user_id, log_seq, adgroup_id)
             loss = criterion(logits.view(-1), label.view(-1))
-            target_emb = model.item_emb(adgroup_id)
-            residual_loss = 0.0
-            for layer_experts in all_layer_experts_output:
-                residual = target_emb.detach()
-                for expert_out in layer_experts:
-                    expert_pred = expert_out[:, -1, :]
-                    residual_loss += F.mse_loss(expert_pred, residual)
-                    residual = residual - expert_pred.detach()
-            total_batch_loss = loss + args.alpha * residual_loss
+            # target_emb = model.item_emb(adgroup_id)
+            # residual_loss = 0.0
+            # for layer_experts in all_layer_experts_output:
+            #     residual = target_emb.detach()
+            #     for expert_out in layer_experts:
+            #         expert_pred = expert_out[:, -1, :]
+            #         residual_loss += F.mse_loss(expert_pred, residual)
+            #         residual = residual - expert_pred.detach()
+            total_batch_loss = loss
             optimizer.zero_grad()
             total_batch_loss.backward()
 
@@ -549,7 +584,8 @@ def evaluate(model, data_loader, criterion, args):
             adgroup_id = batch["target_item"].to(args.device)
             label = batch["label"].float().to(args.device)
 
-            logits, _ = model(user_id, log_seq, adgroup_id)
+            logits, _, _ = model(user_id, log_seq, adgroup_id)
+            # logits = model(user_id, log_seq, adgroup_id)
             loss = criterion(logits.view(-1), label.view(-1))
             total_loss += loss.item() * label.size(0)
             total_samples += label.size(0)
@@ -575,14 +611,14 @@ def evaluate(model, data_loader, criterion, args):
 
 if __name__ == "__main__":
 
-    exp_name = "taobao_boostingmoe_dataset_geq3"  # 实验名称
+    exp_name = "beauty_boostingmoe_entropy_multiply"  # 实验名称
     args = Args()
     with open(f"args_{exp_name}.txt", "w") as f:
         for key, value in vars(args).items():
             f.write(f"{key}: {value}\n")
 
     config = args.__dict__
-    wandb.init(project="SASRec", name=exp_name, config=config)
+    wandb.init(project="beauty", name=exp_name, config=config)
     model = SASRec(args.user_num, args.item_num, args).to(args.device)
     print("model init success")
 
@@ -593,9 +629,7 @@ if __name__ == "__main__":
     print("Building train dataset...")
     train_dataset = TaobaoDataset(
         csv_path=f"{data_dir}/{args.train_file}",
-        all_adgroup_ids=all_adgroup_ids,
         max_seq_len=args.maxlen,
-        num_negative_samples=args.negative_samples,
         split="train",
     )
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
@@ -605,9 +639,7 @@ if __name__ == "__main__":
     print("Building validation dataset...")
     valid_dataset = TaobaoDataset(
         csv_path=f"{data_dir}/{args.valid_file}",
-        all_adgroup_ids=all_adgroup_ids,
         max_seq_len=args.maxlen,
-        num_negative_samples=0,
         split="valid",
     )
     valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
@@ -617,9 +649,7 @@ if __name__ == "__main__":
     print("Building test dataset...")
     test_dataset = TaobaoDataset(
         csv_path=f"{data_dir}/{args.test_file}",
-        all_adgroup_ids=None,
         max_seq_len=args.maxlen,
-        num_negative_samples=0,
         split="test",
     )
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)

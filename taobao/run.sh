@@ -1,1 +1,1 @@
-nohup python train_sequence.py > logs/taobao_boostingmoe_dataset_geq3.log 2>&1 &
+CUDA_VISIBLE_DEVICES=1 nohup python train_sequence.py > logs/beauty_boostingmoe_entropy_multiply.log 2>&1 &
